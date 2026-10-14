@@ -4,6 +4,7 @@ import { useState } from "react";
 import { formatGen } from "@/lib/units";
 import { formatCountdown, formatDate } from "@/lib/time";
 import { STATE, sameAddress, type VaultView } from "@/lib/types";
+import { PartialLoadAlert } from "./PartialLoadAlert";
 import { useAccountVaults } from "./useVaults";
 import { useWallet } from "./WalletProvider";
 import { Badge, Button, Card, Meter, SectionTitle, StateBadge, TxStatus, short, useNow, useTx } from "./ui";
@@ -96,7 +97,8 @@ function OwnerVault({ v }: { v: VaultView }) {
 
 export function OwnerHeartbeat() {
   const { account, connect } = useWallet();
-  const { vaults, status } = useAccountVaults(account);
+  const view = useAccountVaults(account);
+  const { vaults, status } = view;
 
   if (!account) {
     return (
@@ -110,7 +112,14 @@ export function OwnerHeartbeat() {
   if (vaults === null) {
     return (
       <Card className="p-8 text-center text-sm text-slate-600">
-        {status === "syncing" ? "Vault state unavailable while the network read syncs." : "Loading your vaults…"}
+        {status === "syncing" ? (
+          <>
+            Vault state unavailable while the network read syncs.
+            <Button variant="ghost" className="ml-3" onClick={view.retry}>Retry</Button>
+          </>
+        ) : (
+          "Loading your vaults…"
+        )}
       </Card>
     );
   }
@@ -120,8 +129,14 @@ export function OwnerHeartbeat() {
       <SectionTitle eyebrow="Owner control center" title="Prove you are alive, veto false claims">
         A heartbeat resets the inactivity clock. A veto or heartbeat during a claim cancels it and confiscates the claimant&apos;s bond.
       </SectionTitle>
+      <PartialLoadAlert view={view} />
+      {status === "loading" && <p className="mb-3 text-xs text-slate-500">Loading your vaults…</p>}
       {mine.length === 0 ? (
-        <Card className="p-8 text-center text-sm text-slate-600">No vaults owned by {short(account, 6)}. Create one to begin.</Card>
+        // Only claim "none" when every read succeeded; otherwise the alert above
+        // is the truthful statement and this card would be a false one.
+        status === "ready" ? (
+          <Card className="p-8 text-center text-sm text-slate-600">No vaults owned by {short(account, 6)}. Create one to begin.</Card>
+        ) : null
       ) : (
         <div className="grid gap-4 md:grid-cols-2">
           {mine.map((v) => <OwnerVault key={v.id} v={v} />)}

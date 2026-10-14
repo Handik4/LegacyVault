@@ -475,7 +475,7 @@ class LegacyVault(gl.contract.Contract):
         if i < 1:
             i = 1
         while i < total and len(out) < n:
-            out.append(self._vault_view(u256(i), False))
+            out.append(self._vault_view(i, False))
             i += 1
         return out
 

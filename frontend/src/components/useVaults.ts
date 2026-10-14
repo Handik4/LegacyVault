@@ -1,25 +1,34 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { SerialLoader, describeError, readView } from "@/lib/contract";
-import { toOverview, toVault, type VaultView } from "@/lib/types";
+import { toOverview, toVault } from "@/lib/types";
+import {
+  applyVault,
+  failCycle,
+  finishCycle,
+  initialVaultsState,
+  loadByIds,
+  type CycleResult,
+  type VaultsState,
+} from "@/lib/vaultLoad";
+import type { VaultView } from "@/lib/types";
 import { useProtocol } from "./ProtocolProvider";
 
-export interface VaultsState {
-  status: "loading" | "ready" | "syncing";
-  /** null until the first successful read; never an empty array standing in for "unknown". */
-  vaults: VaultView[] | null;
-  error: string | null;
+export type { VaultsState } from "@/lib/vaultLoad";
+export interface VaultsView extends VaultsState {
+  /** Re-run the load now (coalesced if a read is already running). */
+  retry: () => void;
 }
 
 const POLL_MS = 30_000;
 
 function useLoader(
   scope: string | null,
-  load: (signal: AbortSignal, upsert: (v: VaultView[]) => void) => Promise<void>,
-): VaultsState {
+  load: (signal: AbortSignal, onVault: (v: VaultView) => void) => Promise<CycleResult>,
+): VaultsView {
   const { refreshToken } = useProtocol();
-  const [state, setState] = useState<VaultsState>({ status: "loading", vaults: null, error: null });
+  const [state, setState] = useState<VaultsState>(initialVaultsState);
   const loaderRef = useRef<SerialLoader | null>(null);
   const loadRef = useRef(load);
   loadRef.current = load;
@@ -28,20 +37,14 @@ function useLoader(
     if (scope === null) return;
     const loader = new SerialLoader(async (signal) => {
       try {
-        await loadRef.current(signal, (batch) => {
-          if (signal.aborted) return;
-          setState((prev) => {
-            const byId = new Map((prev.vaults ?? []).map((v) => [v.id, v] as const));
-            for (const v of batch) byId.set(v.id, v);
-            return { status: "ready", vaults: [...byId.values()].sort((a, b) => a.id - b.id), error: null };
-          });
+        const result = await loadRef.current(signal, (v) => {
+          if (!signal.aborted) setState((s) => applyVault(s, v));
         });
         if (signal.aborted) return;
-        // An account that owns nothing still completes: [] is a real answer here.
-        setState((prev) => ({ status: "ready", vaults: prev.vaults ?? [], error: null }));
+        setState((s) => finishCycle(s, result));
       } catch (e) {
         if ((e as Error)?.name === "AbortError" || signal.aborted) return;
-        setState((prev) => ({ status: "syncing", vaults: prev.vaults, error: describeError(e) }));
+        setState((s) => failCycle(s, describeError(e)));
       }
     });
     loaderRef.current = loader;
@@ -64,37 +67,42 @@ function useLoader(
     loaderRef.current?.refresh();
   }, [refreshToken]);
 
-  return state;
+  const retry = useCallback(() => loaderRef.current?.refresh(), []);
+  return { ...state, retry };
 }
 
 /**
  * One account's vaults (owned, beneficiary of, or executed). Targeted reads only:
  * `get_vault_ids_for` then `get_vault` per id, rendered as each record arrives.
- * The full `get_vault` record is used on purpose: the summary view strips the
- * heir note references, which is why notes used to vanish on reload.
+ *
+ * Health is per cycle: the view is `ready` only when every indexed id resolved;
+ * otherwise it is `partial` with `failedIds`, however many other reads succeeded.
  */
-export function useAccountVaults(account: string | null): VaultsState {
-  return useLoader(account, async (signal, upsert) => {
-    const ids = (await readView<unknown[]>("get_vault_ids_for", [account], signal)) ?? [];
-    await Promise.all(
-      ids.map(async (raw) => {
-        const id = Number(raw);
-        const v = toVault(await readView("get_vault", [id], signal));
-        upsert([v]);
-      }),
-    );
+export function useAccountVaults(account: string | null): VaultsView {
+  return useLoader(account, async (signal, onVault) => {
+    const raw = (await readView<unknown[]>("get_vault_ids_for", [account], signal)) ?? [];
+    const ids = raw.map(Number);
+    return loadByIds(ids, async (id) => toVault(await readView("get_vault", [id], signal)), onVault);
   });
 }
 
 const PAGE = 25;
 
 /** Every vault, paged. Only the Registries tab uses this (for its vault picker). */
-export function useAllVaults(enabled: boolean): VaultsState {
-  return useLoader(enabled ? "all" : null, async (signal, upsert) => {
+export function useAllVaults(enabled: boolean): VaultsView {
+  return useLoader(enabled ? "all" : null, async (signal, onVault) => {
     const ov = toOverview(await readView("get_protocol_overview", [], signal));
+    const failedIds: number[] = [];
     for (let start = 1; start <= ov.vaultCount; start += PAGE) {
-      const page = (await readView<any[]>("get_vault_summaries", [start, PAGE], signal)) ?? [];
-      upsert(page.map(toVault));
+      try {
+        const page = (await readView<any[]>("get_vault_summaries", [start, PAGE], signal)) ?? [];
+        page.forEach((raw) => onVault(toVault(raw)));
+      } catch (e) {
+        if ((e as Error)?.name === "AbortError") throw e;
+        // A failed page is a failed range, never silently skipped.
+        for (let id = start; id < Math.min(start + PAGE, ov.vaultCount + 1); id++) failedIds.push(id);
+      }
     }
+    return { expected: ov.vaultCount, failedIds };
   });
 }

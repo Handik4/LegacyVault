@@ -5,6 +5,7 @@ import { bpsToPercent } from "@/lib/bps";
 import { formatCountdown, formatDate } from "@/lib/time";
 import { formatGen } from "@/lib/units";
 import { STATE, sameAddress, type VaultView } from "@/lib/types";
+import { PartialLoadAlert } from "./PartialLoadAlert";
 import { useAccountVaults } from "./useVaults";
 import { useWallet } from "./WalletProvider";
 import { Badge, Button, Card, Meter, SectionTitle, StateBadge, TxStatus, short, useNow, useTx } from "./ui";
@@ -156,7 +157,8 @@ function Desk({ v, account }: { v: VaultView; account: string }) {
 
 export function SuccessionDesk() {
   const { account, connect } = useWallet();
-  const { vaults, status } = useAccountVaults(account);
+  const view = useAccountVaults(account);
+  const { vaults, status } = view;
 
   if (!account) {
     return (
@@ -170,7 +172,14 @@ export function SuccessionDesk() {
   if (vaults === null) {
     return (
       <Card className="p-8 text-center text-sm text-slate-600">
-        {status === "syncing" ? "Succession state unavailable while the network read syncs." : "Loading vaults…"}
+        {status === "syncing" ? (
+          <>
+            Succession state unavailable while the network read syncs.
+            <Button variant="ghost" className="ml-3" onClick={view.retry}>Retry</Button>
+          </>
+        ) : (
+          "Loading vaults…"
+        )}
       </Card>
     );
   }
@@ -185,8 +194,12 @@ export function SuccessionDesk() {
       <SectionTitle eyebrow="Succession desk" title="Stake a bond, corroborate, wait out the veto window">
         A claim needs the inactivity window, a bond, three-registry corroboration and a 30-day veto window. Funds are pulled individually by each heir.
       </SectionTitle>
+      <PartialLoadAlert view={view} />
+      {status === "loading" && <p className="mb-3 text-xs text-slate-500">Loading vaults…</p>}
       {mine.length === 0 ? (
-        <Card className="p-8 text-center text-sm text-slate-600">No vault names {short(account, 6)} as beneficiary or executor.</Card>
+        status === "ready" ? (
+          <Card className="p-8 text-center text-sm text-slate-600">No vault names {short(account, 6)} as beneficiary or executor.</Card>
+        ) : null
       ) : (
         <div className="grid gap-4 md:grid-cols-2">
           {mine.map((v) => <Desk key={v.id} v={v} account={account} />)}

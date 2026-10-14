@@ -99,6 +99,16 @@ How each source answer is classified:
 | Valid `CONFIRMED` records that differ in `cert_hash` or `cert_epoch` | **active dissent** | blocks verification → `NO_RECORD` |
 | Timeout, 5xx / 429 / 403, unparseable body, non-object JSON, body over 8 KB, **foreign schema** | down (not responding) | not a responder; can still complete a quorum later |
 
+**`ALIVE`, `PENDING` and every other unconfirmed status are abstentions, exactly
+like a 404; they are never active dissent.** The rationale is a division of labour:
+a registry's role in this protocol is to issue positive proof of death (`CONFIRMED`)
+or to explicitly withdraw one (`REVOKED`). Proof of *life* is not something a
+registry is trusted to assert here. It is enforced exclusively **on-chain, by the
+owner**, through `heartbeat()` or `veto_claim()`, which stay available during the
+challenge window and at any time before `finalize_succession`. A registry that
+merely says "alive" (or "pending") therefore adds no information the owner cannot
+already supply with a signature that no registry can forge or suppress.
+
 Active dissent is deliberately narrow: only an explicit `REVOKED` record or
 conflicting confirmed certificate data. The decision order is: (1) fewer than 2
 responders → `QUORUM_FAILURE`; (2) dissent → `NO_RECORD`; (3) ≥2 matching
@@ -111,14 +121,20 @@ confirmations → `VERIFIED_DECEASED`; (4) confirmed + down sources could still 
 | `CONFIRMED, 404, outage` | `2` QUORUM_FAILURE, bond preserved (the outage could be the second confirmation) |
 | `CONFIRMED, outage, outage` | `2` QUORUM_FAILURE |
 | `CONFIRMED, 404, 404` / `404, 404, outage` / `404, 404, 404` | `0` NO_RECORD (2-of-3 impossible) |
+| `CONFIRMED, 404, ALIVE` (3 clean responses, 1 confirmed) / `ALIVE, 404, outage` | `0` NO_RECORD (2-of-3 impossible; an abstention counts the same as a 404 here) |
 | `CONFIRMED, CONFIRMED, REVOKED` / `CONFIRMED, CONFIRMED, different certificate` / `CONFIRMED, REVOKED, outage` | `0` NO_RECORD (active dissent) |
 
 For verdict `1`, `source_count` is the number of matching confirmations; otherwise it
 is the number of responders.
 
 **What can and cannot forfeit a bond.** Network outages, schema errors and a
-single-source 404 lag cannot force a bond forfeiture. Only ≥2 negative (404)
-responses, or an explicit conflicting / `REVOKED` certificate record, forfeits it.
+single-source 404 lag cannot force a bond forfeiture: `CONFIRMED, 404, outage` is a
+retryable `QUORUM_FAILURE`. A bond is forfeited into the estate only when
+(a) a source returns an explicit `REVOKED` record or conflicting `CONFIRMED`
+certificate data, or (b) two or more sources answer without confirming (two 404s,
+or any mix of 404 / unconfirmed records) so that 2 matching confirmations can no
+longer be reached even if the unreachable source answered, which includes all three
+sources responding cleanly with fewer than 2 confirmations.
 
 ## Security matrix
 
@@ -131,7 +147,7 @@ responses, or an explicit conflicting / `REVOKED` certificate record, forfeits i
 | 5 | Leader smuggles free text into storage | Only three ints and one 64-hex-or-empty digest cross consensus; payload re-gated before state change | `test_validator_rejects_malformed_or_extra_key_payload` |
 | 6 | Premature claim / owner hospitalised | Inactivity ≥90d, 10% bond, 30-day minimum challenge lock (owner may veto any time before finalization), bond confiscated to owner | `test_claim_before_inactivity_threshold_reverts`, `test_owner_veto_slashes_claimant_bond_100_percent` |
 | 7 | Stale / pre-dated certificate | Death date ≥ creation day, ≤ now, ≥ last heartbeat; replay after a veto fails | `test_certificate_predating_vault_creation_rejected`, `test_stale_certificate_cannot_be_replayed_after_a_veto` |
-| 8 | Bond griefing by a malfunctioning registry | Outages, schema errors and a single-source 404 lag cannot forfeit a bond; only ≥2 negative (404) responses or an explicit `REVOKED` / conflicting certificate record can | `test_one_confirmed_one_404_one_outage_returns_quorum_failure_without_slashing`, `test_foreign_schema_is_not_a_response_*` |
+| 8 | Bond griefing by a malfunctioning registry | Outages, schema errors and a single-source 404 lag cannot forfeit a bond (`CONFIRMED, 404, outage` → `QUORUM_FAILURE`); only ≥2 non-confirming answers that make 2-of-3 unreachable, or an explicit `REVOKED` / conflicting certificate record, can | `test_one_confirmed_one_404_one_outage_returns_quorum_failure_without_slashing`, `test_foreign_schema_is_not_a_response_*` |
 | 9 | Third party steals an allocation | `claim_inheritance` requires the caller to be that beneficiary, once | `test_unauthenticated_caller_cannot_steal_heir_allocation`, `test_heir_cannot_double_claim` |
 | 10 | One heir blocks the rest | Pull payments, no payout loop | `test_one_heir_never_claiming_does_not_block_the_others` |
 | 11 | Rounding dust locked | Remainder to heir 0; sum always equals principal | `test_bps_rounding_remainder_assigned_to_primary_heir_zero_dust_locked`, `test_split_never_loses_a_wei` |
@@ -148,17 +164,21 @@ responses, or an explicit conflicting / `REVOKED` certificate record, forfeits i
   false death, only the owner's veto stands between a claimant and the estate.
 - **Registry lag can still cost the claimant.** One lagging registry is tolerated
   (2 matching confirmations + a `404` verifies; `CONFIRMED + 404 + outage` is a
-  retryable `QUORUM_FAILURE`), but if two or more registries answer `404` the claim
-  resolves `NO_RECORD` and the bond joins the estate; the heir can retry with a new
-  bond.
-- **A single faulty registry can act as a safety brake.** If one compromised or
-  misconfigured registry serves a well-formed `REVOKED` record or a conflicting
-  certificate for a real death, it blocks automated succession and the claim bond
-  is forfeited, even though the other two registries are right. The protocol
-  chooses this conservative failure mode over letting a lone dissent be outvoted.
-  Recovery is to have the governor replace the faulty registry slot
-  (`propose_registry` → 7-day timelock → `activate_registry`) and have the heir
-  claim again with a new bond.
+  retryable `QUORUM_FAILURE`), but if two or more registries answer without
+  confirming (e.g. two `404`s) the claim resolves `NO_RECORD` and the bond joins the
+  estate; the heir can retry with a new bond.
+- **A single `REVOKED` record is a unilateral safety brake.** One registry that
+  serves a well-formed `REVOKED` record for the vault's identity, or `CONFIRMED`
+  certificate data that conflicts with the others (different `cert_hash` or
+  `cert_epoch`), is enough on its own to resolve the claim to `NO_RECORD_FOUND` and
+  forfeit the claim bond into the estate, even if the other two registries
+  confirmed the death. This holds whether the record is a compromised registry's
+  lie or a misconfigured one's mistake: the protocol deliberately prefers a
+  conservative failure to letting a lone dissent be outvoted. It lasts until the
+  governor replaces the faulty registry slot (`propose_registry` → **7-day
+  timelock** → `activate_registry`); the heir then claims again with a new bond.
+  By contrast, an `ALIVE` / `PENDING` record or a 404 from that same registry is
+  only an abstention and cannot do this.
 - **Note references are public on-chain.** The contract withholds them from views
   until finalization, but storage is readable. Store ciphertext or a pointer to it.
 - **Duplicate commitments are allowed** (uniqueness would let anyone squat a
@@ -241,7 +261,7 @@ GENVM_VERSION=v0.6.0-rc8 .venv/bin/genvm-lint typecheck contracts/legacy_vault.p
 # Frontend
 cd frontend
 npm install
-npm test                  # 99 unit tests: receipt assessment, amount parsing, identity, bps, registry rules
+npm test                  # 104 unit tests: receipt assessment, amount parsing, identity, bps, registry rules
 npx tsc --noEmit
 npm run build
 ```
@@ -300,7 +320,7 @@ independently of `gen_call`, and records exactly which checks passed.
 this machine's default mirror does not implement the audit endpoint).
 
 **Before:** 15 advisories (5 moderate, 7 high, 3 critical). **After:** 6 (0 moderate,
-5 high, 1 critical) packages flagged. Build, `tsc` and all 99 vitest tests pass after the
+5 high, 1 critical) packages flagged. Build, `tsc` and all 104 vitest tests pass after the
 changes, and the generated CSS was spot-checked for the project's design-token classes.
 
 ### Resolved

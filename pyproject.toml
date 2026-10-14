@@ -1,0 +1,10 @@
+# Pytest configuration for the LegacyVault contract suite.
+#
+#   uv venv --python 3.12
+#   uv pip install --prerelease=allow -r requirements-dev.txt
+#   .venv/bin/python -m pytest -q
+#
+# Lint (pin the GenVM bundle that ships the contract's runner hash):
+#   GENVM_VERSION=v0.6.0-rc8 .venv/bin/genvm-lint check contracts/legacy_vault.py
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,23 @@
+{
+  "network": "studio-next",
+  "chain_id": 61997,
+  "rpc_url": "https://studio-next.genlayer.com/api",
+  "contract_address": "0x1293F2cF068DD6045948Ad3e44aB8Ed0Da67a926",
+  "explorer_url": "https://explorer-studio-next.genlayer.com/address/0x1293F2cF068DD6045948Ad3e44aB8Ed0Da67a926",
+  "source": "contracts/legacy_vault.py",
+  "source_sha256": "fca43e601fd347d06b4ed158110f0f6c00461c8fd28f494d4f70d7b66ec432ff",
+  "verification": {
+    "source_hash": "match",
+    "registries": "NOT VERIFIED: gen_call unavailable (An internal error was received.)",
+    "seed_state": "SKIPPED: fee quote unavailable (An internal error was received.)"
+  },
+  "deploy_tx": "0x8808fa24afcd1df9226c194ae554b07fb8128068b3702241ff00a4264b095e99",
+  "deploy_receipt_check": "ACCEPTED/FINALIZED + MAJORITY_AGREE + FINISHED_WITH_RETURN",
+  "genesis_registries": [
+    "https://raw.githubusercontent.com/moltaphet/LegacyVault/main/registry-mirror/a",
+    "https://cdn.jsdelivr.net/gh/moltaphet/LegacyVault@main/registry-mirror/b",
+    "https://rawcdn.githack.com/moltaphet/LegacyVault/main/registry-mirror/c"
+  ],
+  "seed": null,
+  "recorded_at": "2026-10-14T12:21:24.887Z"
+}

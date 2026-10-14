@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: light; }
+html { background: #faf8f3; }
+body { @apply bg-alabaster font-sans text-ink antialiased; }
+::selection { background: #d3ebdc; }

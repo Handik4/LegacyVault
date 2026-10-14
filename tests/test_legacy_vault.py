@@ -363,9 +363,75 @@ class TestRegistryConsensus:
         assert env.verify(vid) == 0
 
     def test_responders_must_all_agree_one_dissent_blocks(self, env):
+        """2 matching CONFIRMED + a clean 404 still verifies (the 404 abstains);
+        a conflicting positive, an explicit negative, or a lone CONFIRMED blocks."""
         vid = self._ready(env)
+        # 2 matching CONFIRMED + 1 lagging 404 -> VERIFIED_DECEASED
         mock_registries(env.vm, record(env.commit), record(env.commit), 404)
+        assert env.verify(vid) == 1
+        v = env.c.get_vault(vid)
+        assert v["state_name"] == "VETO_CHALLENGE_PERIOD"
+        assert v["claim_bond"] == str(GEN)  # bond intact, not forfeited
+
+    @pytest.mark.parametrize("slot", [0, 1, 2])
+    def test_404_in_any_slot_does_not_block_two_confirmed(self, env, slot):
+        vid = self._ready(env)
+        answers = [record(env.commit)] * 3
+        answers[slot] = 404
+        mock_registries(env.vm, *answers)
+        assert env.verify(vid) == 1
+
+    def test_two_confirmed_plus_conflicting_confirmed_blocks(self, env):
+        vid = self._ready(env)
+        mock_registries(
+            env.vm, record(env.commit), record(env.commit), record(env.commit, certificate_hash="cd" * 32)
+        )
         assert env.verify(vid) == 0
+
+    def test_two_confirmed_plus_conflicting_date_blocks(self, env):
+        vid = self._ready(env)
+        mock_registries(
+            env.vm, record(env.commit), record(env.commit), record(env.commit, date_of_death="2026-02-11")
+        )
+        assert env.verify(vid) == 0
+
+    @pytest.mark.parametrize("status", ["REVOKED", "ALIVE"])
+    def test_two_confirmed_plus_explicit_revoked_or_alive_blocks(self, env, status):
+        vid = self._ready(env)
+        mock_registries(env.vm, record(env.commit), record(env.commit), record(env.commit, status=status))
+        assert env.verify(vid) == 0
+
+    def test_single_confirmed_plus_two_404s_is_no_record(self, env):
+        vid = self._ready(env)
+        mock_registries(env.vm, record(env.commit), 404, 404)
+        assert env.verify(vid) == 0
+
+    def test_two_404s_and_one_outage_is_no_record_not_quorum_failure(self, env):
+        vid = self._ready(env)
+        mock_registries(env.vm, 404, 404, 500)
+        assert env.verify(vid) == 0
+
+    def test_one_responder_only_is_quorum_failure_even_if_confirmed(self, env):
+        vid = self._ready(env)
+        mock_registries(env.vm, record(env.commit), 500, 503)
+        assert env.verify(vid) == 2
+
+    def test_two_confirmed_plus_outage_still_verifies(self, env):
+        vid = self._ready(env)
+        mock_registries(env.vm, record(env.commit), 503, record(env.commit))
+        assert env.verify(vid) == 1
+
+    def test_validator_accepts_verified_payload_with_lagging_404(self, env):
+        vid = env.create()
+        env.warp(100)
+        env.claim(vid)
+        mock_registries(env.vm, record(env.commit), record(env.commit), 404)
+        assert env.verify(vid) == 1
+        assert env.vm.run_validator() is True
+        # source_count counts matching confirmations, so a validator whose third
+        # source is down instead of 404 still agrees with the leader.
+        mock_registries(env.vm, record(env.commit), record(env.commit), 503)
+        assert env.vm.run_validator() is True
 
     def test_conflicting_certificate_hashes_block_verification(self, env):
         vid = self._ready(env)

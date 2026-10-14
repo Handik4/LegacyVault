@@ -18,13 +18,18 @@
 #      contract storage, are https-only / host-shaped / mutually distinct, and
 #      rotate only through a 7-day governor timelock. The record URL is
 #      derived: {registry_base}/{identity_commitment}.json.
-#   2. QUORUM. >= 2 of 3 registries must respond, and every responder must
-#      return the same CONFIRMED certificate (same hash, same date of death).
-#   3. STRICT PAYLOAD EQUIVALENCE. The only thing validators agree on is
-#      {"verdict": int, "source_count": int, "cert_epoch": int}. The validator
-#      checks exact keys / integer types / internal consistency, then re-derives
-#      the payload itself and requires verdict, source_count and cert_epoch to
-#      match. No leader-supplied text ever reaches storage.
+#   2. QUORUM. >= 2 of 3 registries must return the same CONFIRMED certificate
+#      (same hash, same date of death). A clean 404/410 is "no record at this
+#      source": it abstains and cannot veto two matching confirmations (CDN lag),
+#      but a source that returns a conflicting certificate or an explicit
+#      non-confirming record (REVOKED / ALIVE / wrong identity) blocks the
+#      claim. Fewer than 2 responders is a retryable QUORUM_FAILURE.
+#   3. STRICT PAYLOAD EQUIVALENCE. The only thing validators agree on is the
+#      4-field payload {"verdict": int, "source_count": int, "cert_epoch": int,
+#      "cert_hash": str}. The validator checks exact keys / types / internal
+#      consistency (cert_hash is "" unless verdict is 1, then 64-char hex),
+#      re-derives the payload itself and requires all four fields to match. No
+#      leader-supplied free text ever reaches storage.
 #   4. VETO + SLASH. Until finalize_succession() the owner can call
 #      veto_claim() / heartbeat() / revoke_vault(); the claimant's bond is
 #      confiscated to the owner.
@@ -191,8 +196,9 @@ def _evaluate_record(
 def _fetch_source(base_url: str, commitment: str, creation_day: int, now: int, last_heartbeat: int) -> dict:
     """Query ONE registry. Returns {"responded": bool, "state", "cert_hash",
     "death_epoch"}. Unreachable / rate-limited / 5xx / corrupt transport counts
-    as NOT responded; a clean 404/410 or a well-formed non-matching record counts
-    as a responded "no_record"."""
+    as NOT responded; a clean 404/410 is a responded "absent" (abstains, never
+    vetoes); a well-formed non-confirming record is a responded "no_record"
+    (explicit negative)."""
     silent = {"responded": False, "state": "no_record", "cert_hash": "", "death_epoch": 0}
     url = f"{base_url}/{commitment}.json"
     try:
@@ -205,7 +211,7 @@ def _fetch_source(base_url: str, commitment: str, creation_day: int, now: int, l
     if not isinstance(status, int):
         return silent
     if status in (404, 410):
-        return {"responded": True, "state": "no_record", "cert_hash": "", "death_epoch": 0}
+        return {"responded": True, "state": "absent", "cert_hash": "", "death_epoch": 0}
     if not (200 <= status < 300):
         return silent
     try:
@@ -239,13 +245,31 @@ def _fetch_source(base_url: str, commitment: str, creation_day: int, now: int, l
 
 
 def _aggregate(results: list) -> dict:
-    """Collapse per-source outcomes to the discrete consensus payload."""
+    """Collapse per-source outcomes to the discrete consensus payload.
+
+    Each source is one of: not responded (outage / 5xx / foreign schema),
+    "absent" (clean 404/410: no record at this source, which abstains from
+    positive proof), "confirmed" (a valid CONFIRMED record), or "no_record" (a
+    well-formed record that is NOT a valid confirmation for this vault: REVOKED,
+    ALIVE, wrong identity, predates the vault, ...; an explicit negative).
+
+      * fewer than 2 responders                      -> QUORUM_FAILURE
+      * >= 2 CONFIRMED, one identical certificate
+        (hash + epoch), and no source that holds a
+        conflicting or explicitly negative record    -> VERIFIED_DECEASED
+      * anything else with >= 2 responders           -> NO_RECORD
+
+    A lagging mirror that still answers 404 therefore cannot veto two matching
+    confirmations, while a registry that affirmatively contradicts them can.
+    For VERIFIED_DECEASED, source_count is the number of matching confirmations;
+    otherwise it is the number of responders."""
     responded = [r for r in results if r["responded"]]
     n = len(responded)
     if n < MIN_SOURCES:
         return {"verdict": V_QUORUM_FAILURE, "source_count": n, "cert_epoch": 0, "cert_hash": ""}
     confirmed = [r for r in responded if r["state"] == "confirmed"]
-    if len(confirmed) == n:
+    dissent = [r for r in responded if r["state"] == "no_record"]
+    if len(confirmed) >= MIN_SOURCES and not dissent:
         first = confirmed[0]
         if all(
             r["cert_hash"] == first["cert_hash"] and r["death_epoch"] == first["death_epoch"]
@@ -253,7 +277,7 @@ def _aggregate(results: list) -> dict:
         ):
             return {
                 "verdict": V_VERIFIED_DECEASED,
-                "source_count": n,
+                "source_count": len(confirmed),
                 "cert_epoch": int(first["death_epoch"]),
                 "cert_hash": first["cert_hash"],
             }

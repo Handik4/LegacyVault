@@ -5,12 +5,18 @@ succession claim, **three-source vital-record consensus** performed by GenVM
 validators, and a **30-day veto-and-slash window** that lets a living owner cancel
 a fraudulent claim and confiscate the claimant's bond.
 
+> **What "30 days" means.** The 30-day period is a *minimum challenge lock*: it is
+> the earliest moment `finalize_succession` can be called after a death record is
+> verified. It is not a deadline for the owner. A living owner keeps the right to
+> `veto_claim` (or `heartbeat` / `revoke_vault`) **at any time before the estate is
+> finalized**, including after the 30 days have elapsed if nobody has finalized yet.
+
 | | |
 |---|---|
 | **Network** | GenLayer Studio Next, chain `61997` |
-| **Contract** | [`0xAcB4509274F8C6311ddeEd6116D61dAB81B47163`](https://explorer-studio-next.genlayer.com/address/0xAcB4509274F8C6311ddeEd6116D61dAB81B47163) |
-| **Deploy tx** | `0xe3a8d024cd13db823c1728e978c6b96c2846bcb81f857f6d968807fcff6555cf` (FINALIZED, MAJORITY_AGREE, FINISHED_WITH_RETURN) |
-| **Source hash** | `sha256 d6a49a07…d1644`, byte-identical to `contracts/legacy_vault.py` (checked against the explorer's copy of the deploy tx) |
+| **Contract** | [`0x110a44B8941882d3d65Ffc1018f4Ce6C330D1cB0`](https://explorer-studio-next.genlayer.com/address/0x110a44B8941882d3d65Ffc1018f4Ce6C330D1cB0) |
+| **Deploy tx** | `0xfd6de2e846d5cbdff66f566f50eec97b98b59c3b909e5bdd091e6f9f93858b9b` (FINALIZED, MAJORITY_AGREE, FINISHED_WITH_RETURN) |
+| **Source hash** | `sha256 31c1bcdd57dd691c09f591ce9f0e4314083b53dba0bf5cd27b9a98372fbf5b13`, byte-identical to `contracts/legacy_vault.py` (on-chain code fetched via `gen_getContractCode` and re-hashed) |
 | **RPC** | `https://studio-next.genlayer.com/api` |
 
 ## Status, stated plainly
@@ -24,13 +30,13 @@ a fraudulent claim and confiscate the claimant's bond.
   `FeeValueMustBeNonZero(1)` because no fee quote could be derived. The deploy
   script now skips the seed when no quote exists and records that in
   `deployments/studio-next.json`. To seed once the RPC recovers:
-  `LEGACYVAULT_DEPLOY_TX=0xe3a8d024… genlayer deploy --rpc https://studio-next.genlayer.com/api`
+  `LEGACYVAULT_DEPLOY_TX=0xfd6de2e8… genlayer deploy --rpc https://studio-next.genlayer.com/api`
 - **Constructor state not read back** for the same reason (`verification.registries`).
 - **Registry mirrors** are served from [`deployments/mock_registry/`](deployments/mock_registry/README.md)
   of `github.com/Handik4/LegacyVault` through three distinct hosts (raw.githubusercontent.com,
   jsDelivr, githack). They are one repository behind three CDNs, i.e. a testnet
   simulation of three registries, not independent civil authorities.
-- **No live-consensus integration run.** The 206 contract tests run in GenVM *direct
+- **No live-consensus integration run.** The 218 contract tests run in GenVM *direct
   mode*, which executes the leader function and replays validator closures via
   `run_validator`; it does not exercise real multi-validator consensus.
 - **No third-party audit.** "Hardened" means the invariants below are each pinned by
@@ -78,14 +84,25 @@ is compared by every validator; it is never free text.
 
 | verdict | Meaning | Effect |
 |---|---|---|
-| `0` NO_RECORD_FOUND | ≥2 sources answered and they did not all confirm the same certificate | claim rejected; bond forfeited **into the estate** |
-| `1` VERIFIED_DECEASED | ≥2 sources answered, every responder confirmed the same certificate hash and date | enter 30-day veto window |
-| `2` QUORUM_FAILURE | fewer than 2 sources answered | nothing changes; retry without slashing |
+| `0` NO_RECORD_FOUND | ≥2 sources responded (200 or 404) but fewer than 2 matching `CONFIRMED` records, or a source holds a conflicting / explicitly negative record | claim rejected; bond forfeited **into the estate** |
+| `1` VERIFIED_DECEASED | ≥2 sources returned `CONFIRMED` with the identical `cert_hash` and `cert_epoch`, and no responder returned a conflicting or negative record | enter the 30-day challenge lock |
+| `2` QUORUM_FAILURE | fewer than 2 sources responded | nothing changes; retry without slashing |
 
-A source "responds" on a clean 404/410 or a well-formed record in the LegacyVault
-schema. Timeouts, 5xx/429/403, unparseable bodies, non-object JSON, bodies over 8 KB
-and **foreign schemas** all count as *not responding*, so a broken registry can
-never force a bond forfeiture on an honest claimant.
+How each source answer is classified:
+
+| Source answer | Treated as | Effect on quorum |
+|---|---|---|
+| Valid `CONFIRMED` record for this vault | positive proof | counts toward the ≥2 matching confirmations |
+| Clean `404` / `410` | **absent**: "no record at this source" | responds, but abstains; it cannot veto two matching confirmations (CDN lag / regional sync delay) |
+| Well-formed record that is not a valid confirmation here (`REVOKED`, `ALIVE`, wrong identity, predates the vault, death in the future, ...) | explicit negative | blocks verification → `NO_RECORD` |
+| `CONFIRMED` with a different `cert_hash` or `cert_epoch` than the others | conflicting positive | blocks verification → `NO_RECORD` |
+| Timeout, 5xx / 429 / 403, unparseable body, non-object JSON, body over 8 KB, **foreign schema** | not responding | does not count as a responder |
+
+So `CONFIRMED + CONFIRMED + 404` verifies, while `CONFIRMED + CONFIRMED + REVOKED`,
+`CONFIRMED + CONFIRMED + (different certificate)` and `CONFIRMED + 404 + 404` all
+resolve to `NO_RECORD`. For verdict `1`, `source_count` is the number of matching
+confirmations; otherwise it is the number of responders. A broken registry can never
+force a bond forfeiture on an honest claimant, because a foreign schema is an outage.
 
 A record is `CONFIRMED` only if: schema matches; `identity_commitment` equals the
 vault's; `status == "CONFIRMED"`; `certificate_hash` is 64-hex; `date_of_death` is a
@@ -98,12 +115,12 @@ before the owner's last heartbeat** (an owner cannot sign after the day they die
 |---|---|---|---|
 | 1 | Claimant points validators at a forged page | No URL parameter exists. Record URL = `{governed base}/{commitment}.json`; bases are https-only DNS names (no IP literals, ports, userinfo, query), pairwise distinct hosts | `test_nothing_in_the_abi_accepts_a_url`, `test_record_url_is_derived_from_commitment_not_supplied`, `test_constructor_rejects_unsafe_registry_urls` |
 | 2 | Governor swaps in malicious registries | 7-day timelock (`propose_registry` → permissionless `activate_registry`), independence re-checked, governor has no fund path | `test_rotation_is_timelocked_seven_days`, `test_governor_has_no_path_to_user_funds` |
-| 3 | One registry lies or lags | Quorum ≥2; unanimity among responders; conflicting cert hash or date → NO_RECORD | `test_responders_must_all_agree_one_dissent_blocks`, `test_conflicting_*` |
-| 4 | Leader forges verdict / source count / epoch | Validator rejects wrong keys, non-int/bool types, out-of-range or inconsistent values, then re-derives and compares all three fields | `TestValidatorEquivalence` (9 tests) |
-| 5 | Leader smuggles free text into storage | Only three ints cross consensus; payload re-gated before state change | `test_validator_rejects_malformed_or_extra_key_payload` |
-| 6 | Premature claim / owner hospitalised | Inactivity ≥90d, 10% bond, 30-day veto, bond confiscated to owner | `test_claim_before_inactivity_threshold_reverts`, `test_owner_veto_slashes_claimant_bond_100_percent` |
+| 3 | One registry lies or lags | 2-of-3 matching `CONFIRMED` quorum. A lagging `404` abstains and cannot veto two matching confirmations; a conflicting cert hash/date or an explicit `REVOKED`/`ALIVE` record blocks → `NO_RECORD` | `test_responders_must_all_agree_one_dissent_blocks`, `test_404_in_any_slot_does_not_block_two_confirmed`, `test_two_confirmed_plus_*`, `test_conflicting_*` |
+| 4 | Leader forges verdict / source count / epoch | Validator rejects wrong keys, non-int/bool types, out-of-range or inconsistent values, then re-derives and compares all four fields | `TestValidatorEquivalence` (9 tests) |
+| 5 | Leader smuggles free text into storage | Only three ints and one 64-hex-or-empty digest cross consensus; payload re-gated before state change | `test_validator_rejects_malformed_or_extra_key_payload` |
+| 6 | Premature claim / owner hospitalised | Inactivity ≥90d, 10% bond, 30-day minimum challenge lock (owner may veto any time before finalization), bond confiscated to owner | `test_claim_before_inactivity_threshold_reverts`, `test_owner_veto_slashes_claimant_bond_100_percent` |
 | 7 | Stale / pre-dated certificate | Death date ≥ creation day, ≤ now, ≥ last heartbeat; replay after a veto fails | `test_certificate_predating_vault_creation_rejected`, `test_stale_certificate_cannot_be_replayed_after_a_veto` |
-| 8 | Bond griefing by a malfunctioning registry | Only a clean answer can slash; foreign schema = outage | `test_foreign_schema_is_not_a_response_*` |
+| 8 | Bond griefing by a malfunctioning registry | Only a clean answer can slash; foreign schema = outage; a lone `404` among matching confirmations never slashes | `test_foreign_schema_is_not_a_response_*` |
 | 9 | Third party steals an allocation | `claim_inheritance` requires the caller to be that beneficiary, once | `test_unauthenticated_caller_cannot_steal_heir_allocation`, `test_heir_cannot_double_claim` |
 | 10 | One heir blocks the rest | Pull payments, no payout loop | `test_one_heir_never_claiming_does_not_block_the_others` |
 | 11 | Rounding dust locked | Remainder to heir 0; sum always equals principal | `test_bps_rounding_remainder_assigned_to_primary_heir_zero_dust_locked`, `test_split_never_loses_a_wei` |
@@ -118,8 +135,10 @@ before the owner's last heartbeat** (an owner cannot sign after the day they die
 
 - **Registry honesty is the root of trust.** If all responding registries confirm a
   false death, only the owner's veto stands between a claimant and the estate.
-- **Registry lag costs the claimant.** A real death not yet published yields
-  `NO_RECORD` and the bond joins the estate; the heir can retry with a new bond.
+- **Registry lag can still cost the claimant.** One lagging registry is tolerated
+  (2 matching confirmations + a `404` verifies), but if fewer than 2 registries have
+  published yet, the claim resolves `NO_RECORD` and the bond joins the estate; the
+  heir can retry with a new bond.
 - **Note references are public on-chain.** The contract withholds them from views
   until finalization, but storage is readable. Store ciphertext or a pointer to it.
 - **Duplicate commitments are allowed** (uniqueness would let anyone squat a
@@ -128,11 +147,58 @@ before the owner's last heartbeat** (an owner cannot sign after the day they die
   90-day wait or the direct-mode test suite.
 - Studio Next has no time travel; the veto path is demonstrated in tests.
 
+## Threat model: trust assumptions disclosed
+
+These are properties of the design that a reviewer should weigh. None is hidden by a
+test; each is a stated assumption.
+
+### Governor trust assumption
+
+The `governor` has **no withdrawal path** (`test_governor_has_no_path_to_user_funds`);
+it can only propose registry rotations. It is nevertheless a trusted role: a
+compromised **single-key** governor could collude with a designated beneficiary by
+rotating **two of the three** registry slots to endpoints they control, and so
+manufacture a 2-of-3 `CONFIRMED` quorum for a living owner. The attack is bounded by
+(a) the **7-day rotation timelock**, during which the staged endpoints are public in
+contract storage, (b) the **90-day minimum inactivity** the owner must have shown,
+(c) the **30-day challenge lock** and the owner's right to veto, which slashes the
+claimant's bond, and (d) the per-slot uniqueness rule, which stops one endpoint from
+filling several slots. It is not prevented outright. **For production the governor
+must be a multi-sig (or a DAO / timelocked contract), never a single EOA.** On the
+Studio Next deployment the governor is the deploying key, a throwaway test account.
+
+### Identity commitment privacy
+
+The identity commitment is `SHA-256(full_name|birth_date|jurisdiction_id)`, an
+**unsalted, deterministic** hash. Consequences:
+
+- Anyone who knows (or can enumerate) the off-chain PII can compute the commitment
+  and recognise the vault on-chain; low-entropy inputs can be brute-forced.
+- The registry CDNs observe the queried commitment (it is the file name) every time
+  validators verify a claim, and the file is public.
+
+An optional **per-vault salt** would add pre-claim privacy: the owner commits to
+`SHA-256(salt|full_name|birth_date|jurisdiction_id)`, and the salt is shared
+off-chain with heirs and published in (or alongside) the registry record only at
+claim time, so the commitment is not guessable before a claim. This is not
+implemented in this version, and the registry schema would need a `salt` field.
+
+### Validator propagation liveness
+
+Validators must agree **exactly** on `verdict`, `source_count`, `cert_epoch` and
+`cert_hash`. If a certificate is published (or a CDN cache expires) *between* the
+leader's fetch and a validator's fetch, they can see different data and the round
+disagrees; consensus then rotates leaders and retries until the registries'
+caches settle. This is a liveness delay, not a safety failure: a disagreeing round
+never changes state. Counting only matching confirmations in `source_count` for
+verdict `1` reduces (but does not remove) these false disagreements, since a third
+source flipping between `404` and an outage no longer changes the payload.
+
 ## Repository layout
 
 ```
 contracts/legacy_vault.py        Intelligent Contract
-tests/                           pytest direct-mode suite (206 cases)
+tests/                           pytest direct-mode suite (218 cases)
 deploy/deploy_legacy_vault.ts    genlayer deploy script: fee derivation, strict receipts, seed + verify
 deployments/studio-next.json     deployment record (what was and was not verified)
 deployments/legacy_vault_abi.json  schema from genvm-lint
@@ -146,7 +212,7 @@ frontend/                        Next.js 14.2.35 + Tailwind light-mode UI
 # Contract tests (Python 3.12 required by the genlayer-test pin)
 uv venv --python 3.12
 uv pip install --prerelease=allow -r requirements-dev.txt
-.venv/bin/python -m pytest -q                     # 206 passed
+.venv/bin/python -m pytest -q                     # 218 passed
 
 # Lint + SDK validation + Pyright typecheck (both clean)
 GENVM_VERSION=v0.6.0-rc8 .venv/bin/genvm-lint check contracts/legacy_vault.py

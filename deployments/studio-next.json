@@ -2,16 +2,16 @@
   "network": "studio-next",
   "chain_id": 61997,
   "rpc_url": "https://studio-next.genlayer.com/api",
-  "contract_address": "0xAcB4509274F8C6311ddeEd6116D61dAB81B47163",
-  "explorer_url": "https://explorer-studio-next.genlayer.com/address/0xAcB4509274F8C6311ddeEd6116D61dAB81B47163",
+  "contract_address": "0x110a44B8941882d3d65Ffc1018f4Ce6C330D1cB0",
+  "explorer_url": "https://explorer-studio-next.genlayer.com/address/0x110a44B8941882d3d65Ffc1018f4Ce6C330D1cB0",
   "source": "contracts/legacy_vault.py",
-  "source_sha256": "d6a49a07418219874e56c5a05128ff0ad0eb72d8defc5e3b76a7e23d1c2d1644",
+  "source_sha256": "31c1bcdd57dd691c09f591ce9f0e4314083b53dba0bf5cd27b9a98372fbf5b13",
   "verification": {
     "source_hash": "match",
     "registries": "NOT VERIFIED: gen_call unavailable (An internal error was received.)",
-    "seed_state": "SKIPPED: fee quote unavailable (An unknown RPC error occurred.)"
+    "seed_state": "SKIPPED: fee quote unavailable (An internal error was received.)"
   },
-  "deploy_tx": "0xe3a8d024cd13db823c1728e978c6b96c2846bcb81f857f6d968807fcff6555cf",
+  "deploy_tx": "0xfd6de2e846d5cbdff66f566f50eec97b98b59c3b909e5bdd091e6f9f93858b9b",
   "deploy_receipt_check": "ACCEPTED/FINALIZED + MAJORITY_AGREE + FINISHED_WITH_RETURN",
   "genesis_registries": [
     "https://raw.githubusercontent.com/Handik4/LegacyVault/main/deployments/mock_registry/a",
@@ -19,5 +19,5 @@
     "https://rawcdn.githack.com/Handik4/LegacyVault/main/deployments/mock_registry/c"
   ],
   "seed": null,
-  "recorded_at": "2026-10-14T19:30:54.804Z"
+  "recorded_at": "2026-10-14T20:37:04.817Z"
 }

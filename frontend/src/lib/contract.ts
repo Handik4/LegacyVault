@@ -19,7 +19,7 @@ export const NETWORK = {
 } as const;
 
 export const CONTRACT_ADDRESS: string =
-  process.env.NEXT_PUBLIC_LEGACYVAULT_ADDRESS ?? "0x1293F2cF068DD6045948Ad3e44aB8Ed0Da67a926";
+  process.env.NEXT_PUBLIC_LEGACYVAULT_ADDRESS ?? "0xaeE92c13Cd48F77D43992A957634DECf637A2dFf";
 
 export const READ_TIMEOUT_MS = 6_000;
 
@@ -87,6 +87,75 @@ export async function readWithTimeout<T>(
   } finally {
     clearTimeout(timer);
     external?.removeEventListener("abort", onExternal);
+  }
+}
+
+// ---- serialized loading -------------------------------------------------------
+/**
+ * Runs an async read at most once at a time.
+ *
+ *  - `poll()`    is the background tick. While a read is in flight it does
+ *                nothing: no abort, no stacked request. (The previous design made
+ *                the tick an effect dependency, so every tick aborted an
+ *                in-flight full-history read and restarted it; any read slower
+ *                than the interval therefore never completed.)
+ *  - `refresh()` is an explicit request (e.g. after a transaction). While a read
+ *                is in flight it is coalesced into exactly ONE follow-up read, so
+ *                the post-transaction state is never skipped and never doubled.
+ *  - `dispose()` aborts the in-flight read; used on unmount only.
+ *
+ * `run` owns its own error handling; anything it throws is swallowed here so a
+ * failed read can never wedge the lock.
+ */
+export class SerialLoader {
+  private inFlight = false;
+  private queued = false;
+  private disposed = false;
+  private ac: AbortController | null = null;
+
+  constructor(private readonly run: (signal: AbortSignal) => Promise<void>) {}
+
+  get isFetching(): boolean {
+    return this.inFlight;
+  }
+
+  poll(): boolean {
+    if (this.disposed || this.inFlight) return false;
+    void this.start();
+    return true;
+  }
+
+  refresh(): void {
+    if (this.disposed) return;
+    if (this.inFlight) {
+      this.queued = true;
+      return;
+    }
+    void this.start();
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.queued = false;
+    this.ac?.abort();
+  }
+
+  private async start(): Promise<void> {
+    this.inFlight = true;
+    const ac = new AbortController();
+    this.ac = ac;
+    try {
+      await this.run(ac.signal);
+    } catch {
+      /* run() reports its own failures */
+    } finally {
+      this.inFlight = false;
+      this.ac = null;
+      if (this.queued && !this.disposed) {
+        this.queued = false;
+        void this.start();
+      }
+    }
   }
 }
 

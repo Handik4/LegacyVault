@@ -4,7 +4,7 @@ import { useState } from "react";
 import { formatGen } from "@/lib/units";
 import { formatCountdown, formatDate } from "@/lib/time";
 import { STATE, sameAddress, type VaultView } from "@/lib/types";
-import { useProtocol } from "./ProtocolProvider";
+import { useAccountVaults } from "./useVaults";
 import { useWallet } from "./WalletProvider";
 import { Badge, Button, Card, Meter, SectionTitle, StateBadge, TxStatus, short, useNow, useTx } from "./ui";
 
@@ -96,7 +96,7 @@ function OwnerVault({ v }: { v: VaultView }) {
 
 export function OwnerHeartbeat() {
   const { account, connect } = useWallet();
-  const { vaults, status } = useProtocol();
+  const { vaults, status } = useAccountVaults(account);
 
   if (!account) {
     return (

@@ -5,6 +5,7 @@ import { READ_TIMEOUT_MS, readWithTimeout } from "@/lib/contract";
 import { DAY, aggregate, evaluateRecord, type Consensus, type SourceOutcome } from "@/lib/registry";
 import { nowSeconds } from "@/lib/time";
 import { useProtocol } from "./ProtocolProvider";
+import { useAllVaults } from "./useVaults";
 import { Badge, Button, Card, Field, SectionTitle, inputCls, short } from "./ui";
 
 interface Probe {
@@ -46,7 +47,8 @@ async function probe(baseUrl: string, commitment: string, ctx: Parameters<typeof
 }
 
 export function RegistryInspector() {
-  const { overview, vaults, status } = useProtocol();
+  const { overview, status } = useProtocol();
+  const { vaults } = useAllVaults(true);
   const [selected, setSelected] = useState("");
   const [manual, setManual] = useState("");
   const [busy, setBusy] = useState(false);

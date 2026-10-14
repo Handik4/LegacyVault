@@ -5,7 +5,7 @@ import { bpsToPercent } from "@/lib/bps";
 import { formatCountdown, formatDate } from "@/lib/time";
 import { formatGen } from "@/lib/units";
 import { STATE, sameAddress, type VaultView } from "@/lib/types";
-import { useProtocol } from "./ProtocolProvider";
+import { useAccountVaults } from "./useVaults";
 import { useWallet } from "./WalletProvider";
 import { Badge, Button, Card, Meter, SectionTitle, StateBadge, TxStatus, short, useNow, useTx } from "./ui";
 
@@ -131,8 +131,14 @@ function Desk({ v, account }: { v: VaultView; account: string }) {
           {myHeir && !myHeir.claimed && (
             <Button className="mt-3" disabled={tx.busy} onClick={runClaim}>Claim my allocation &amp; key-shard reference</Button>
           )}
-          {myHeir?.claimed && <p className="mt-3 text-xs text-slate-600">Your note reference: <span className="break-all font-mono">{myHeir.noteRef || "—"}</span></p>}
-          {note !== null && <p className="mt-3 rounded-lg bg-forest-50 p-3 text-sm text-forest-800">Note reference: <span className="break-all font-mono">{note || "(none registered)"}</span></p>}
+          {myHeir && (myHeir.noteRef || note) && (
+            <p className="mt-3 rounded-lg bg-forest-50 p-3 text-sm text-forest-800">
+              Your key-shard reference: <span className="break-all font-mono">{myHeir.noteRef || note}</span>
+            </p>
+          )}
+          {myHeir && !myHeir.noteRef && !note && myHeir.claimed && (
+            <p className="mt-3 text-xs text-slate-600">No note reference was registered for your share.</p>
+          )}
         </div>
       )}
 
@@ -150,7 +156,7 @@ function Desk({ v, account }: { v: VaultView; account: string }) {
 
 export function SuccessionDesk() {
   const { account, connect } = useWallet();
-  const { vaults, status } = useProtocol();
+  const { vaults, status } = useAccountVaults(account);
 
   if (!account) {
     return (

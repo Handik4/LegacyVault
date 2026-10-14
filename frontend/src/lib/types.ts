@@ -33,6 +33,7 @@ export interface VaultView {
   claimStartedAt: number;
   vetoUntil: number;
   certEpoch: number;
+  certHash: string;
   verifyAttempts: number;
   requiredBond: bigint;
   heirs: Heir[];
@@ -89,6 +90,7 @@ export function toVault(raw: any): VaultView {
     claimStartedAt: num(raw.claim_started_at),
     vetoUntil: num(raw.veto_until),
     certEpoch: num(raw.cert_epoch),
+    certHash: str(raw.cert_hash),
     verifyAttempts: num(raw.verify_attempts),
     requiredBond: big(raw.required_bond),
     heirs: (Array.isArray(raw.beneficiaries) ? raw.beneficiaries : []).map((b: any) => ({

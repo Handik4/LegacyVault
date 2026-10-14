@@ -1,0 +1,7 @@
+{
+  "schema": "legacyvault.vital-record/v1",
+  "identity_commitment": "9fb736df3c6ee8ba6416b35a04c78abddc77f4c2438442fcc4f2f5a14417bfc9",
+  "status": "CONFIRMED",
+  "certificate_hash": "ea73c589964d82134447db24fd06d622753d5d39345920c88d65923e9568e7db",
+  "date_of_death": "2026-10-14"
+}

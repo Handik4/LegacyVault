@@ -1,8 +1,8 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { readView, describeError } from "@/lib/contract";
-import { toOverview, toVault, type Overview, type VaultView } from "@/lib/types";
+import { SerialLoader, describeError, readView } from "@/lib/contract";
+import { toOverview, type Overview } from "@/lib/types";
 
 export type ReadStatus = "loading" | "ready" | "syncing";
 
@@ -10,8 +10,12 @@ interface ProtocolState {
   status: ReadStatus;
   /** null until a successful read: callers must render "—", never a fake zero. */
   overview: Overview | null;
-  vaults: VaultView[] | null;
   syncMessage: string | null;
+  /**
+   * Increments on every explicit refresh (e.g. after a transaction). Per-account
+   * hooks watch it to re-read their own records.
+   */
+  refreshToken: number;
   refresh: () => void;
 }
 
@@ -23,51 +27,53 @@ export function useProtocol(): ProtocolState {
   return v;
 }
 
-const PAGE = 25;
+const POLL_MS = 30_000;
 
+/**
+ * Holds only the protocol overview: one cheap read. Vault records are loaded by
+ * the panels that need them (useAccountVaults / useAllVaults), so no panel waits
+ * on a full-history traversal and the poll below can never abort one.
+ */
 export function ProtocolProvider({ children }: { children: React.ReactNode }) {
   const [status, setStatus] = useState<ReadStatus>("loading");
   const [overview, setOverview] = useState<Overview | null>(null);
-  const [vaults, setVaults] = useState<VaultView[] | null>(null);
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
-  const [tick, setTick] = useState(0);
-  const generation = useRef(0);
+  const [refreshToken, setRefreshToken] = useState(0);
+  const loaderRef = useRef<SerialLoader | null>(null);
 
   useEffect(() => {
-    const gen = ++generation.current;
-    const ac = new AbortController();
-    (async () => {
+    const loader = new SerialLoader(async (signal) => {
       try {
-        const ov = toOverview(await readView("get_protocol_overview", [], ac.signal));
-        const all: VaultView[] = [];
-        for (let start = 1; start <= ov.vaultCount; start += PAGE) {
-          const page = (await readView<any[]>("get_vault_summaries", [start, PAGE], ac.signal)) ?? [];
-          for (const raw of page) all.push(toVault(raw));
-        }
-        if (gen !== generation.current) return; // a newer load superseded this one
+        const ov = toOverview(await readView("get_protocol_overview", [], signal));
+        if (signal.aborted) return;
         setOverview(ov);
-        setVaults(all);
         setSyncMessage(null);
         setStatus("ready");
       } catch (e) {
-        if ((e as Error)?.name === "AbortError" || gen !== generation.current) return;
+        if ((e as Error)?.name === "AbortError" || signal.aborted) return;
+        // Keep the last good overview; the banner explains it may be stale.
         setSyncMessage(describeError(e));
         setStatus("syncing");
       }
-    })();
-    return () => ac.abort();
-  }, [tick]);
-
-  // Gentle background refresh; stale-while-syncing keeps the last good data.
-  useEffect(() => {
-    const id = setInterval(() => setTick((t) => t + 1), 30_000);
-    return () => clearInterval(id);
+    });
+    loaderRef.current = loader;
+    loader.refresh();
+    const id = setInterval(() => loader.poll(), POLL_MS);
+    return () => {
+      clearInterval(id);
+      loader.dispose();
+      loaderRef.current = null;
+    };
   }, []);
 
-  const refresh = useCallback(() => setTick((t) => t + 1), []);
+  const refresh = useCallback(() => {
+    loaderRef.current?.refresh();
+    setRefreshToken((t) => t + 1);
+  }, []);
+
   const value = useMemo(
-    () => ({ status, overview, vaults, syncMessage, refresh }),
-    [status, overview, vaults, syncMessage, refresh],
+    () => ({ status, overview, syncMessage, refreshToken, refresh }),
+    [status, overview, syncMessage, refreshToken, refresh],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

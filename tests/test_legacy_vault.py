@@ -513,13 +513,15 @@ class TestRegistryConsensus:
 
 # ============================================== validator equivalence (forgery)
 class TestValidatorEquivalence:
+    EPOCH = day_epoch("2026-02-10")
+
     def _verified(self, env):
         vid = env.create()
         env.warp(100)
         env.claim(vid)
         env.all_confirmed()
         env.verify(vid)
-        return {"verdict": 1, "source_count": 3, "cert_epoch": day_epoch("2026-02-10")}
+        return {"verdict": 1, "source_count": 3, "cert_epoch": self.EPOCH, "cert_hash": CERT}
 
     def test_validator_accepts_exact_honest_payload(self, env):
         honest = self._verified(env)
@@ -542,25 +544,37 @@ class TestValidatorEquivalence:
         assert env.vm.run_validator(leader_result={**honest, "cert_epoch": honest["cert_epoch"] + DAY}) is False
         assert env.vm.run_validator(leader_result={**honest, "cert_epoch": 0}) is False
 
+    def test_validator_rejects_forged_certificate_hash(self, env):
+        """The hash is what the replay guard keys on, so a leader that swapped
+        it could dodge (or poison) the invalidation record."""
+        honest = self._verified(env)
+        assert env.vm.run_validator(leader_result={**honest, "cert_hash": "cd" * 32}) is False
+        assert env.vm.run_validator(leader_result={**honest, "cert_hash": ""}) is False
+        assert env.vm.run_validator(leader_result={**honest, "cert_hash": CERT.upper()}) is False
+
     def test_validator_rejects_malformed_or_extra_key_payload(self, env):
         honest = self._verified(env)
+        e = honest["cert_epoch"]
         bad_payloads = [
             {**honest, "note": "death certificate looks fine"},  # leader free text
-            {"verdict": 1, "source_count": 3},  # missing key
-            {"verdict": 1, "cert_epoch": honest["cert_epoch"]},
+            {"verdict": 1, "source_count": 3, "cert_epoch": e},  # missing cert_hash
+            {"verdict": 1, "source_count": 3, "cert_hash": CERT},  # missing cert_epoch
+            {"verdict": 1, "cert_epoch": e, "cert_hash": CERT},
             {},
-            {"verdict": "1", "source_count": 3, "cert_epoch": honest["cert_epoch"]},
-            {"verdict": 1.0, "source_count": 3, "cert_epoch": honest["cert_epoch"]},
-            {"verdict": True, "source_count": 3, "cert_epoch": honest["cert_epoch"]},
-            {"verdict": 1, "source_count": 3.0, "cert_epoch": honest["cert_epoch"]},
-            {"verdict": 1, "source_count": None, "cert_epoch": honest["cert_epoch"]},
-            {"verdict": 1, "source_count": 3, "cert_epoch": str(honest["cert_epoch"])},
-            {"verdict": 7, "source_count": 3, "cert_epoch": honest["cert_epoch"]},
-            {"verdict": -1, "source_count": 3, "cert_epoch": honest["cert_epoch"]},
-            {"verdict": 1, "source_count": -3, "cert_epoch": honest["cert_epoch"]},
-            {"verdict": 1, "source_count": 4, "cert_epoch": honest["cert_epoch"]},
-            {"verdict": 1, "source_count": 3, "cert_epoch": -5},
-            [1, 3, honest["cert_epoch"]],
+            {**honest, "verdict": "1"},
+            {**honest, "verdict": 1.0},
+            {**honest, "verdict": True},
+            {**honest, "source_count": 3.0},
+            {**honest, "source_count": None},
+            {**honest, "cert_epoch": str(e)},
+            {**honest, "cert_hash": 12345},
+            {**honest, "cert_hash": None},
+            {**honest, "verdict": 7},
+            {**honest, "verdict": -1},
+            {**honest, "source_count": -3},
+            {**honest, "source_count": 4},
+            {**honest, "cert_epoch": -5},
+            [1, 3, e, CERT],
             "VERIFIED_DECEASED",
             1,
             None,
@@ -568,12 +582,15 @@ class TestValidatorEquivalence:
         for p in bad_payloads:
             assert env.vm.run_validator(leader_result=p) is False, p
 
-    def test_validator_rejects_internally_inconsistent_verified_payload(self, env):
+    def test_validator_rejects_internally_inconsistent_payloads(self, env):
         self._verified(env)
-        # verified with <2 sources / no certificate epoch is impossible
-        assert env.vm.run_validator(leader_result={"verdict": 1, "source_count": 1, "cert_epoch": 5}) is False
-        assert env.vm.run_validator(leader_result={"verdict": 1, "source_count": 3, "cert_epoch": 0}) is False
-        assert env.vm.run_validator(leader_result={"verdict": 2, "source_count": 3, "cert_epoch": 0}) is False
+        e = self.EPOCH
+        assert env.vm.run_validator(leader_result={"verdict": 1, "source_count": 1, "cert_epoch": e, "cert_hash": CERT}) is False
+        assert env.vm.run_validator(leader_result={"verdict": 1, "source_count": 3, "cert_epoch": 0, "cert_hash": CERT}) is False
+        assert env.vm.run_validator(leader_result={"verdict": 2, "source_count": 3, "cert_epoch": 0, "cert_hash": ""}) is False
+        # a non-verified verdict may not carry a certificate
+        assert env.vm.run_validator(leader_result={"verdict": 0, "source_count": 3, "cert_epoch": 0, "cert_hash": CERT}) is False
+        assert env.vm.run_validator(leader_result={"verdict": 2, "source_count": 1, "cert_epoch": e, "cert_hash": ""}) is False
 
     def test_validator_rejects_a_leader_error(self, env):
         self._verified(env)
@@ -591,8 +608,10 @@ class TestValidatorEquivalence:
         mock_registries(env.vm, 404, 404, 404)
         assert env.verify(vid) == 0
         assert env.vm.run_validator() is True
-        assert env.vm.run_validator(leader_result={"verdict": 0, "source_count": 3, "cert_epoch": 0}) is True
-        assert env.vm.run_validator(leader_result={"verdict": 1, "source_count": 3, "cert_epoch": day_epoch("2026-02-10")}) is False
+        assert env.vm.run_validator(leader_result={"verdict": 0, "source_count": 3, "cert_epoch": 0, "cert_hash": ""}) is True
+        assert env.vm.run_validator(
+            leader_result={"verdict": 1, "source_count": 3, "cert_epoch": self.EPOCH, "cert_hash": CERT}
+        ) is False
 
     def test_validator_agrees_on_quorum_failure_and_blocks_upgrade_to_verified(self, env):
         vid = env.create()
@@ -602,7 +621,7 @@ class TestValidatorEquivalence:
         assert env.verify(vid) == 2
         assert env.vm.run_validator() is True
         assert env.vm.run_validator(
-            leader_result={"verdict": 1, "source_count": 2, "cert_epoch": day_epoch("2026-02-10")}
+            leader_result={"verdict": 1, "source_count": 2, "cert_epoch": self.EPOCH, "cert_hash": CERT}
         ) is False
 
 
@@ -685,7 +704,9 @@ class TestVetoAndSlash:
         env.c.veto_claim(vid)
         env.warp(101 + 90)
         env.claim(vid)
-        env.all_confirmed(date_of_death="2026-04-20")  # genuinely after the owner's last ping
+        # genuinely after the owner's last ping AND a different certificate: the
+        # vetoed one is invalidated for this vault regardless of the date shown
+        env.all_confirmed(date_of_death="2026-04-20", certificate_hash="ef" * 32)
         assert env.verify(vid) == 1
 
     def test_stale_certificate_cannot_be_replayed_after_a_veto(self, env):
@@ -893,6 +914,81 @@ class TestDistribution:
         assert amounts[0] == 11 * GEN * 6000 // 10000
 
 
+# ================================================ certificate replay guard
+class TestCertificateReplay:
+    SAME_DAY = "2026-04-11"  # == the veto day, so the heartbeat-contradiction rule alone would NOT stop a replay
+
+    def _veto_same_day_cert(self, env, via="veto_claim"):
+        vid = env.create()
+        env.warp(100)  # 2026-04-11
+        env.claim(vid)
+        env.all_confirmed(date_of_death=self.SAME_DAY)
+        assert env.verify(vid) == 1
+        env.vm.sender = env.owner
+        getattr(env.c, via)(vid)
+        return vid
+
+    def test_previously_vetoed_certificate_cannot_be_replayed_in_future_claim(self, env, transfers):
+        vid = self._veto_same_day_cert(env)
+        assert env.c.is_certificate_invalidated(vid, CERT) is True
+        env.warp(100 + 90)
+        env.claim(vid, env.bob)
+        env.all_confirmed(date_of_death=self.SAME_DAY)  # the very same certificate
+        before = int(env.c.get_vault(vid)["principal"])
+        assert env.verify(vid, env.bob) == 0  # rejected, not VERIFIED
+        v = env.c.get_vault(vid)
+        assert v["state_name"] == "ACTIVE" and v["cert_hash"] == ""
+        assert int(v["principal"]) == before + GEN  # replayer's bond joined the estate
+        assert total_to(transfers, env.hex["bob"]) == 0
+
+    def test_heartbeat_during_veto_period_also_invalidates_the_certificate(self, env):
+        vid = self._veto_same_day_cert(env, via="heartbeat")
+        assert env.c.is_certificate_invalidated(vid, CERT) is True
+
+    def test_revoke_during_veto_period_invalidates_the_certificate(self, env):
+        vid = self._veto_same_day_cert(env, via="revoke_vault")
+        assert env.c.is_certificate_invalidated(vid, CERT) is True
+
+    def test_a_different_certificate_is_still_accepted_after_a_veto(self, env):
+        vid = self._veto_same_day_cert(env)
+        env.warp(100 + 90)  # 2026-07-10
+        env.claim(vid, env.bob)
+        env.all_confirmed(date_of_death="2026-07-09", certificate_hash="cd" * 32)
+        assert env.verify(vid, env.bob) == 1
+        assert env.c.get_vault(vid)["cert_hash"] == "cd" * 32
+
+    def test_veto_before_verification_invalidates_nothing(self, env):
+        vid = env.create()
+        env.warp(100)
+        env.claim(vid)
+        env.vm.sender = env.owner
+        env.c.veto_claim(vid)
+        assert env.c.is_certificate_invalidated(vid, CERT) is False
+
+    def test_invalidation_is_scoped_to_one_vault_so_it_cannot_poison_a_victims_heirs(self, env):
+        """Duplicate commitments are allowed, so an attacker can verify the
+        victim's real certificate on a throwaway vault and veto it. That must not
+        lock out the victim's own vault."""
+        attacker = env.create(heirs=[("alice", 10000)], sender=env.owner)
+        victim = env.create(heirs=[("bob", 10000)], sender=env.charlie)  # same commitment
+        env.warp(100)
+        env.claim(attacker, env.alice)
+        env.all_confirmed(date_of_death=self.SAME_DAY)
+        env.verify(attacker, env.alice)
+        env.vm.sender = env.owner
+        env.c.veto_claim(attacker)
+        assert env.c.is_certificate_invalidated(attacker, CERT) is True
+        assert env.c.is_certificate_invalidated(victim, CERT) is False
+        env.claim(victim, env.bob)
+        env.all_confirmed(date_of_death=self.SAME_DAY)
+        assert env.verify(victim, env.bob) == 1
+
+    def test_verified_vault_exposes_its_certificate_hash(self, env):
+        vid = env.to_veto()
+        assert env.c.get_vault(vid)["cert_hash"] == CERT
+        assert env.c.is_certificate_invalidated(vid, CERT) is False
+
+
 # ========================================================= terminal states
 class TestTerminalStates:
     def _succeeded(self, env):
@@ -1067,9 +1163,9 @@ class TestRegistryGovernance:
 
         c = direct_deploy(
             CONTRACT,
-            "https://raw.githubusercontent.com/moltaphet/LegacyVault/main/registry-mirror/a",
-            "https://cdn.jsdelivr.net/gh/moltaphet/LegacyVault@main/registry-mirror/b",
-            "https://rawcdn.githack.com/moltaphet/LegacyVault/main/registry-mirror/c",
+            "https://raw.githubusercontent.com/Handik4/LegacyVault/main/deployments/mock_registry/a",
+            "https://cdn.jsdelivr.net/gh/Handik4/LegacyVault@main/deployments/mock_registry/b",
+            "https://rawcdn.githack.com/Handik4/LegacyVault/main/deployments/mock_registry/c",
         )
         assert [r["host"] for r in c.get_registries()] == [
             "raw.githubusercontent.com", "cdn.jsdelivr.net", "rawcdn.githack.com"
@@ -1148,6 +1244,89 @@ class TestRegistryGovernance:
     def test_governor_has_no_path_to_user_funds(self, env):
         names = {n for n in dir(env.c) if not n.startswith("_")}
         assert not {n for n in names if "drain" in n or "sweep" in n or "rescue" in n}
+
+
+    def test_duplicate_registry_url_cannot_satisfy_multi_source_quorum(self, env):
+        """Slots must be pairwise unique by URL AND host, counting staged
+        rotations, so a single operator can never fill the quorum alone."""
+        env.vm.sender = env.owner
+        # 1. same URL as another ACTIVE slot
+        with env.vm.expect_revert("registry duplicates slot"):
+            env.c.propose_registry(0, REG_B)
+        # 2. same HOST as another active slot, different path
+        with env.vm.expect_revert("registry duplicates slot"):
+            env.c.propose_registry(0, "https://civil-registry-b.deathindex.net/other/path")
+        # 3. stage a legitimate rotation on slot 1, then try to stage the same
+        #    URL and the same host on slot 2: pending-vs-pending must collide.
+        env.c.propose_registry(1, self.NEW)
+        with env.vm.expect_revert("registry duplicates slot"):
+            env.c.propose_registry(2, self.NEW)
+        with env.vm.expect_revert("registry duplicates slot"):
+            env.c.propose_registry(2, self.NEW + "/v2")
+        # 4. a slot may restage a different path on its OWN host
+        env.c.propose_registry(1, self.NEW + "/v2")
+        # nothing changed: three distinct active hosts remain
+        hosts = [r["host"] for r in env.c.get_registries()]
+        assert len(set(hosts)) == 3
+        # and a verification with two real sources + one dead still needs two
+        # DIFFERENT hosts: the registry list can never contain a repeat
+        assert hosts == [
+            "civil-registry-a.vitalrecords.org",
+            "civil-registry-b.deathindex.net",
+            "civil-registry-c.statevitals.gov",
+        ]
+
+    def test_activation_rechecks_uniqueness_against_current_slots(self, env):
+        env.vm.sender = env.owner
+        env.c.propose_registry(0, self.NEW)  # pending on slot 0
+        env.warp(7)
+        env.c.activate_registry(0)
+        # slot 1 may not be pointed at the host slot 0 now occupies
+        with env.vm.expect_revert("registry duplicates slot"):
+            env.c.propose_registry(1, self.NEW + "/mirror")
+
+    def test_activation_blocks_a_collision_created_after_staging(self, env):
+        """Stage slot 1 -> host X while slot 0 is still on A; then slot 0 is
+        rotated to X first. Slot 1's activation must now fail."""
+        env.vm.sender = env.owner
+        env.c.propose_registry(1, "https://civil-registry-x.unique-one.org/r")
+        env.c.cancel_registry_rotation(1)  # staging X on slot 0 requires X to be free
+        env.c.propose_registry(0, "https://civil-registry-x.unique-one.org/r")
+        env.c.propose_registry(1, "https://civil-registry-y.unique-two.org/r")
+        env.warp(7)
+        env.c.activate_registry(0)
+        env.c.activate_registry(1)
+        assert len({r["host"] for r in env.c.get_registries()}) == 3
+
+
+# ========================================================== account indexes
+class TestAccountIndex:
+    def test_owner_heir_and_executor_vault_ids_are_indexed(self, env):
+        a = env.create()  # owner, heirs bob+charlie
+        b = env.create(heirs=[("alice", 10000)], executor=env.hex["bob"])
+        assert env.c.get_vault_ids_for(env.hex["owner"]) == [a, b]
+        assert env.c.get_vault_ids_for(env.hex["bob"]) == [a, b]  # heir of a, executor of b
+        assert env.c.get_vault_ids_for(env.hex["charlie"]) == [a]
+        assert env.c.get_vault_ids_for(env.hex["alice"]) == [b]
+
+    def test_unknown_or_malformed_address_yields_empty_list(self, env):
+        env.create()
+        assert env.c.get_vault_ids_for("0x" + "ab" * 20) == []
+        assert env.c.get_vault_ids_for("not-an-address") == []
+        assert env.c.get_vault_ids_for("") == []
+
+    def test_index_lookup_is_case_insensitive(self, env):
+        a = env.create()
+        assert env.c.get_vault_ids_for(env.hex["bob"].lower()) == [a]
+
+    def test_full_detail_view_carries_note_refs_after_finalization(self, env):
+        """get_vault (not the summary) is the record that persists heir notes."""
+        vid = env.to_veto()
+        env.warp(131)
+        env.vm.sender = env.alice
+        env.c.finalize_succession(vid)
+        full = env.c.get_vault(vid)
+        assert [b["note_ref"] for b in full["beneficiaries"]] == ["ipfs://cipher-bob", "ipfs://cipher-charlie"]
 
 
 # ================================================================= solvency

@@ -43,9 +43,9 @@ const RETRIES = 200;
 // once this repository is pushed to GitHub; the governor can rotate any of them
 // through the 7-day timelock.
 const DEFAULT_REGISTRIES = [
-  "https://raw.githubusercontent.com/moltaphet/LegacyVault/main/registry-mirror/a",
-  "https://cdn.jsdelivr.net/gh/moltaphet/LegacyVault@main/registry-mirror/b",
-  "https://rawcdn.githack.com/moltaphet/LegacyVault/main/registry-mirror/c",
+  "https://raw.githubusercontent.com/Handik4/LegacyVault/main/deployments/mock_registry/a",
+  "https://cdn.jsdelivr.net/gh/Handik4/LegacyVault@main/deployments/mock_registry/b",
+  "https://rawcdn.githack.com/Handik4/LegacyVault/main/deployments/mock_registry/c",
 ];
 
 // Demo identity. Fictional: the commitment is the only thing that goes on-chain.

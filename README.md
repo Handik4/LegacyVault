@@ -8,9 +8,9 @@ a fraudulent claim and confiscate the claimant's bond.
 | | |
 |---|---|
 | **Network** | GenLayer Studio Next, chain `61997` |
-| **Contract** | [`0x1293F2cF068DD6045948Ad3e44aB8Ed0Da67a926`](https://explorer-studio-next.genlayer.com/address/0x1293F2cF068DD6045948Ad3e44aB8Ed0Da67a926) |
-| **Deploy tx** | `0x8808fa24afcd1df9226c194ae554b07fb8128068b3702241ff00a4264b095e99` (FINALIZED, MAJORITY_AGREE, FINISHED_WITH_RETURN) |
-| **Source hash** | `sha256 fca43e60…432ff`, byte-identical to `contracts/legacy_vault.py` (checked against the explorer's copy of the deploy tx) |
+| **Contract** | [`0xaeE92c13Cd48F77D43992A957634DECf637A2dFf`](https://explorer-studio-next.genlayer.com/address/0xaeE92c13Cd48F77D43992A957634DECf637A2dFf) |
+| **Deploy tx** | `0x8a15cbd043f7a58f42a6657d1ffb02aaf830f1c247bfc8dad00951424e5d157a` (FINALIZED, MAJORITY_AGREE, FINISHED_WITH_RETURN) |
+| **Source hash** | `sha256 118e3a8e…289b3`, byte-identical to `contracts/legacy_vault.py` (checked against the explorer's copy of the deploy tx) |
 | **RPC** | `https://studio-next.genlayer.com/api` |
 
 ## Status, stated plainly
@@ -24,13 +24,13 @@ a fraudulent claim and confiscate the claimant's bond.
   `FeeValueMustBeNonZero(1)` because no fee quote could be derived. The deploy
   script now skips the seed when no quote exists and records that in
   `deployments/studio-next.json`. To seed once the RPC recovers:
-  `LEGACYVAULT_DEPLOY_TX=0x8808fa24… genlayer deploy --rpc https://studio-next.genlayer.com/api`
+  `LEGACYVAULT_DEPLOY_TX=0x8a15cbd0… genlayer deploy --rpc https://studio-next.genlayer.com/api`
 - **Constructor state not read back** for the same reason (`verification.registries`).
-- **Registry mirrors resolve only after this repo is pushed** to `github.com/moltaphet/LegacyVault`
-  (see [`registry-mirror/`](registry-mirror/README.md)). They are one repository
-  behind three CDNs, i.e. a testnet simulation of three registries, not independent
-  civil authorities.
-- **No live-consensus integration run.** The 191 contract tests run in GenVM *direct
+- **Registry mirrors** are served from [`deployments/mock_registry/`](deployments/mock_registry/README.md)
+  of `github.com/Handik4/LegacyVault` through three distinct hosts (raw.githubusercontent.com,
+  jsDelivr, githack). They are one repository behind three CDNs, i.e. a testnet
+  simulation of three registries, not independent civil authorities.
+- **No live-consensus integration run.** The 206 contract tests run in GenVM *direct
   mode*, which executes the leader function and replays validator closures via
   `run_validator`; it does not exercise real multi-validator consensus.
 - **No third-party audit.** "Hardened" means the invariants below are each pinned by
@@ -71,7 +71,10 @@ a fraudulent claim and confiscate the claimant's bond.
 
 ### Consensus payload
 
-Validators agree on exactly `{"verdict": int, "source_count": int, "cert_epoch": int}`.
+Validators agree on exactly `{"verdict": int, "source_count": int, "cert_epoch": int, "cert_hash": str}`.
+`cert_hash` is `""` unless the verdict is `1`, in which case it must be a 64-char lower-case
+hex digest. It is the key for the per-vault replay guard, so it crosses consensus and
+is compared by every validator; it is never free text.
 
 | verdict | Meaning | Effect |
 |---|---|---|
@@ -106,7 +109,10 @@ before the owner's last heartbeat** (an owner cannot sign after the day they die
 | 11 | Rounding dust locked | Remainder to heir 0; sum always equals principal | `test_bps_rounding_remainder_assigned_to_primary_heir_zero_dust_locked`, `test_split_never_loses_a_wei` |
 | 12 | Vault frozen by absent claimant | `withdraw_claim`, permissionless `expire_claim` after 30d | `TestClaimUnwind` |
 | 13 | Payout enqueue failure destroys accounting | Failure reverts the whole call (`ERR_TRANSFER_FAILED_RESTORED`) | `test_failing_payout_reverts_with_classified_error` |
-| 14 | Zero / negative / dust deposits, bad bps | Strict validation | `test_strict_input_validation_blocks_negative_or_zero_deposits` |
+| 14 | One operator fills the quorum by registering the same endpoint in several slots | A URL **and** a host may occupy one slot only, checked against other slots' active *and staged* endpoints at proposal, and re-checked at activation | `test_duplicate_registry_url_cannot_satisfy_multi_source_quorum`, `test_activation_*` |
+| 15 | A vetoed certificate is replayed in a later claim | `veto_claim` / `heartbeat` / `revoke_vault` during the challenge period record `"<vault_id>:<cert_hash>"` in `invalidated_certs`; `verify_claim` treats a replay as `NO_RECORD` (bond joins the estate) | `test_previously_vetoed_certificate_cannot_be_replayed_in_future_claim` |
+| 16 | Attacker poisons a victim's certificate via a throwaway vault with the same commitment | The invalidation record is **per vault**, not global | `test_invalidation_is_scoped_to_one_vault_so_it_cannot_poison_a_victims_heirs` |
+| 17 | Zero / negative / dust deposits, bad bps | Strict validation | `test_strict_input_validation_blocks_negative_or_zero_deposits` |
 
 ### Known limits (design, not bugs)
 
@@ -126,11 +132,11 @@ before the owner's last heartbeat** (an owner cannot sign after the day they die
 
 ```
 contracts/legacy_vault.py        Intelligent Contract
-tests/                           pytest direct-mode suite (191 cases)
+tests/                           pytest direct-mode suite (206 cases)
 deploy/deploy_legacy_vault.ts    genlayer deploy script: fee derivation, strict receipts, seed + verify
 deployments/studio-next.json     deployment record (what was and was not verified)
 deployments/legacy_vault_abi.json  schema from genvm-lint
-registry-mirror/                 testnet registry record format and templates
+deployments/mock_registry/       testnet registry fixtures (served via 3 hosts)
 frontend/                        Next.js 14.2.35 + Tailwind light-mode UI
 ```
 
@@ -140,7 +146,7 @@ frontend/                        Next.js 14.2.35 + Tailwind light-mode UI
 # Contract tests (Python 3.12 required by the genlayer-test pin)
 uv venv --python 3.12
 uv pip install --prerelease=allow -r requirements-dev.txt
-.venv/bin/python -m pytest -q                     # 191 passed
+.venv/bin/python -m pytest -q                     # 206 passed
 
 # Lint + SDK validation
 GENVM_VERSION=v0.6.0-rc8 .venv/bin/genvm-lint check contracts/legacy_vault.py
@@ -148,7 +154,7 @@ GENVM_VERSION=v0.6.0-rc8 .venv/bin/genvm-lint check contracts/legacy_vault.py
 # Frontend
 cd frontend
 npm install
-npm test                  # 87 unit tests: receipt assessment, amount parsing, identity, bps, registry rules
+npm test                  # 92 unit tests: receipt assessment, amount parsing, identity, bps, registry rules
 npx tsc --noEmit
 npm run build
 ```
@@ -184,6 +190,13 @@ independently of `gen_call`, and records exactly which checks passed.
   results are tied to the component's AbortController and discarded after unmount.
 - **Input validation:** GEN amounts must be plain positive decimals (no sign, exponent,
   hex, separators, >18 dp); whole numbers digits-only; bps must total 10000.
+- **Polling cannot abort a read.** A `SerialLoader` holds an in-flight lock: the 30s tick
+  is a no-op while a read is running (no abort, no stacking); explicit refreshes during
+  a read coalesce into exactly one follow-up. Aborts happen only on unmount.
+- **Owner / Succession panels load per account.** They use `get_vault_ids_for` +
+  `get_vault`, rendering each record as it arrives, instead of waiting on a traversal
+  of every vault. Heir notes come from the full `get_vault` record (the paged summary
+  view deliberately omits them), so they survive a reload.
 - **Reads:** every read runs under a 6-second AbortController. On failure the
   `SyncAlert` banner appears and values render `—`, never `0`. This was exercised
   for real against the failing RPC during development.

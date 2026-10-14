@@ -31,6 +31,14 @@
 #   5. ZERO-DUST BPS. Shares sum to exactly 10000; the integer remainder goes
 #      to heir index 0, so no wei is stranded. Heirs pull their own share.
 #   6. PULL PAYMENT. No loop ever pays out. Each heir calls claim_inheritance().
+#   7. NO CERTIFICATE REPLAY. A certificate that a living owner vetoed is
+#      recorded against THAT vault and can never open another claim on it. The
+#      record is per-vault on purpose: duplicate identity commitments are
+#      allowed, so a global blacklist would let an attacker veto a victim's real
+#      certificate through a throwaway vault and lock the victim's heirs out.
+#   8. UNIQUE SOURCES. A registry URL or host may appear in at most one slot,
+#      counting both active and staged (pending) rotations, so one operator can
+#      never fill the 3-source quorum by itself.
 
 import json
 import re
@@ -40,7 +48,7 @@ from typing import NoReturn
 
 import genlayer as gl
 from genlayer import Address, u256
-from genlayer.storage import TreeMap
+from genlayer.storage import DynArray, TreeMap
 
 # genvm-lint requires the bare name `allow_storage` on storage dataclasses.
 allow_storage = gl.storage.allow
@@ -235,7 +243,7 @@ def _aggregate(results: list) -> dict:
     responded = [r for r in results if r["responded"]]
     n = len(responded)
     if n < MIN_SOURCES:
-        return {"verdict": V_QUORUM_FAILURE, "source_count": n, "cert_epoch": 0}
+        return {"verdict": V_QUORUM_FAILURE, "source_count": n, "cert_epoch": 0, "cert_hash": ""}
     confirmed = [r for r in responded if r["state"] == "confirmed"]
     if len(confirmed) == n:
         first = confirmed[0]
@@ -247,8 +255,9 @@ def _aggregate(results: list) -> dict:
                 "verdict": V_VERIFIED_DECEASED,
                 "source_count": n,
                 "cert_epoch": int(first["death_epoch"]),
+                "cert_hash": first["cert_hash"],
             }
-    return {"verdict": V_NO_RECORD, "source_count": n, "cert_epoch": 0}
+    return {"verdict": V_NO_RECORD, "source_count": n, "cert_epoch": 0, "cert_hash": ""}
 
 
 def _is_int(x: object) -> bool:
@@ -257,30 +266,33 @@ def _is_int(x: object) -> bool:
 
 def _payload_well_formed(p: object) -> bool:
     """Exact-structure gate for a consensus payload. Rejects extra / missing
-    keys, non-integer (incl. bool / str / float) values and internally
-    inconsistent combinations, so a leader cannot smuggle anything else in."""
+    keys, wrong types (bool counts as wrong) and internally inconsistent
+    combinations, so a leader cannot smuggle anything else in. `cert_hash` is
+    either "" or a 64-char lower-case hex digest; it is never free text."""
     if not isinstance(p, dict):
         return False
-    if set(p.keys()) != {"verdict", "source_count", "cert_epoch"}:
+    if set(p.keys()) != {"verdict", "source_count", "cert_epoch", "cert_hash"}:
         return False
-    v, n, c = p["verdict"], p["source_count"], p["cert_epoch"]
+    v, n, c, h = p["verdict"], p["source_count"], p["cert_epoch"], p["cert_hash"]
     if not (_is_int(v) and _is_int(n) and _is_int(c)):
+        return False
+    if not isinstance(h, str):
         return False
     if v not in (V_NO_RECORD, V_VERIFIED_DECEASED, V_QUORUM_FAILURE):
         return False
     if n < 0 or n > REGISTRY_COUNT or c < 0:
         return False
-    if v == V_QUORUM_FAILURE:
-        return n < MIN_SOURCES and c == 0
-    if n < MIN_SOURCES:
-        return False
     if v == V_VERIFIED_DECEASED:
-        return c > 0
-    return c == 0
+        return n >= MIN_SOURCES and c > 0 and _HEX64.match(h) is not None
+    if h != "" or c != 0:
+        return False
+    if v == V_QUORUM_FAILURE:
+        return n < MIN_SOURCES
+    return n >= MIN_SOURCES
 
 
 def _payloads_agree(theirs: object, mine: object) -> bool:
-    """Validator decision: both payloads well-formed and byte-equal on every
+    """Validator decision: both payloads well-formed and equal on every
     consensus field."""
     if not _payload_well_formed(theirs) or not _payload_well_formed(mine):
         return False
@@ -288,7 +300,12 @@ def _payloads_agree(theirs: object, mine: object) -> bool:
         int(theirs["verdict"]) == int(mine["verdict"])  # type: ignore[index]
         and int(theirs["source_count"]) == int(mine["source_count"])  # type: ignore[index]
         and int(theirs["cert_epoch"]) == int(mine["cert_epoch"])  # type: ignore[index]
+        and theirs["cert_hash"] == mine["cert_hash"]  # type: ignore[index]
     )
+
+
+def _cert_key(vault_id: int, cert_hash: str) -> str:
+    return f"{vault_id}:{cert_hash}"
 
 
 def _valid_commitment(s: str) -> bool:
@@ -325,6 +342,7 @@ class Vault:
     cert_epoch: u256
     verify_attempts: u256
     finalized_at: u256
+    cert_hash: str  # certificate hash that opened the current veto window
 
 
 @allow_storage
@@ -347,6 +365,11 @@ class LegacyVault(gl.contract.Contract):
     registry_url: TreeMap[u256, str]  # slot 0..2 -> active registry base URL
     registry_pending_url: TreeMap[u256, str]
     registry_pending_at: TreeMap[u256, u256]  # activation epoch (0 == none)
+    # "<vault_id>:<cert_hash>" -> True once a living owner vetoed that certificate
+    invalidated_certs: TreeMap[str, bool]
+    # address hex -> ids of vaults it owns / is an heir of / executes. Lets the
+    # UI load one account's vaults without walking the whole vault history.
+    account_vaults: TreeMap[str, DynArray[u256]]
 
     def __init__(self, registry_a: str, registry_b: str, registry_c: str):
         urls = [registry_a, registry_b, registry_c]
@@ -417,6 +440,27 @@ class LegacyVault(gl.contract.Contract):
     @gl.public.view
     def get_vault(self, vault_id: u256) -> dict:
         return self._vault_view(vault_id, True)
+
+    @gl.public.view
+    def get_vault_ids_for(self, address_hex: str) -> list:
+        """Ids of every vault this address owns, is a beneficiary of, or
+        executes. O(1) in the number of vaults overall: this is what lets a
+        panel load one account's vaults without traversing history."""
+        key = address_hex.strip()
+        if not re.match(r"^0x[0-9a-fA-F]{40}$", key):
+            return []
+        key = Address(key).as_hex
+        if key not in self.account_vaults:
+            return []
+        out = []
+        arr = self.account_vaults[key]
+        for i in range(len(arr)):
+            out.append(int(arr[i]))
+        return out
+
+    @gl.public.view
+    def is_certificate_invalidated(self, vault_id: u256, cert_hash: str) -> bool:
+        return self._is_invalidated(int(vault_id), cert_hash.strip().lower())
 
     @gl.public.view
     def get_vault_summaries(self, start: u256, count: u256) -> list:
@@ -519,11 +563,17 @@ class LegacyVault(gl.contract.Contract):
             cert_epoch=0,
             verify_attempts=0,
             finalized_at=0,
+            cert_hash="",
         )
         for i in range(n):
             self.beneficiaries[vid * 8 + i] = Beneficiary(
                 addr=addrs[i], bps=shares_bps[i], note_ref=note_refs[i], amount=0, claimed=False
             )
+        self._index_vault(owner.as_hex, vid)
+        for a in addrs:
+            self._index_vault(a.as_hex, vid)
+        if executor_hex != "":
+            self._index_vault(executor_hex, vid)
         self.escrowed += value
         return vid
 
@@ -536,7 +586,7 @@ class LegacyVault(gl.contract.Contract):
         st = int(v.state)
         if st not in (ST_ACTIVE, ST_CLAIM_INITIATED, ST_VETO_PERIOD):
             _fail(ERR_STATE, "vault is closed")
-        slashed = self._cancel_open_claim(v)
+        slashed = self._cancel_open_claim(int(vault_id), v)
         v.last_heartbeat = self._now()
         self.vaults[vault_id] = v
         if slashed > 0:
@@ -550,7 +600,7 @@ class LegacyVault(gl.contract.Contract):
         self._only_owner(v)
         if int(v.state) not in (ST_CLAIM_INITIATED, ST_VETO_PERIOD):
             _fail(ERR_STATE, "no open claim to veto")
-        slashed = self._cancel_open_claim(v)
+        slashed = self._cancel_open_claim(int(vault_id), v)
         v.last_heartbeat = self._now()
         self.vaults[vault_id] = v
         self._pay(v.owner, slashed)
@@ -563,7 +613,7 @@ class LegacyVault(gl.contract.Contract):
         self._only_owner(v)
         if int(v.state) not in (ST_ACTIVE, ST_CLAIM_INITIATED, ST_VETO_PERIOD):
             _fail(ERR_STATE, "vault is closed")
-        slashed = self._cancel_open_claim(v)
+        slashed = self._cancel_open_claim(int(vault_id), v)
         payout = int(v.principal) + slashed
         self.escrowed -= int(v.principal)
         v.principal = 0
@@ -638,10 +688,17 @@ class LegacyVault(gl.contract.Contract):
         verdict = int(payload["verdict"])
 
         v.verify_attempts = int(v.verify_attempts) + 1
+        cert_hash = str(payload["cert_hash"])
+        if verdict == V_VERIFIED_DECEASED and self._is_invalidated(int(vault_id), cert_hash):
+            # The owner already vetoed this exact certificate on this vault, which
+            # proved them alive after it was issued. Presenting it again is a
+            # rejected claim: same consequence as NO_RECORD, bond joins the estate.
+            verdict = V_NO_RECORD
         if verdict == V_VERIFIED_DECEASED:
             v.state = ST_VETO_PERIOD
             v.veto_until = now + VETO_WINDOW
             v.cert_epoch = int(payload["cert_epoch"])
+            v.cert_hash = cert_hash
         elif verdict == V_NO_RECORD:
             # Bond forfeited into the estate: a failed lookup proves nothing
             # about whether the owner is alive, so the penalty stays with the
@@ -738,23 +795,22 @@ class LegacyVault(gl.contract.Contract):
     @gl.public.write
     def propose_registry(self, index: int, base_url: str) -> None:
         """Governor stages a registry rotation. It only takes effect after
-        REGISTRY_TIMELOCK, giving owners a window to react."""
+        REGISTRY_TIMELOCK, giving owners a window to react. Neither the URL nor
+        its host may match ANY other slot, active or staged."""
         if gl.message.sender_address != self.governor:
             _fail(ERR_AUTH, "governor only")
         if not _is_int(index) or index < 0 or index >= REGISTRY_COUNT:
             _fail(ERR_INPUT, "registry index out of range")
         if not _valid_registry_base(base_url):
             _fail(ERR_INPUT, "registry base URL must be https://<dns-name>[/path]")
-        host = _registry_host(base_url)
-        for i in range(REGISTRY_COUNT):
-            if i != index and _registry_host(self.registry_url[i]) == host:
-                _fail(ERR_INPUT, "registries must live on independent hosts")
+        self._assert_registry_unique(index, base_url, include_pending=True)
         self.registry_pending_url[index] = base_url
         self.registry_pending_at[index] = self._now() + REGISTRY_TIMELOCK
 
     @gl.public.write
     def activate_registry(self, index: int) -> None:
-        """Permissionless: apply a staged rotation once its timelock elapsed."""
+        """Permissionless: apply a staged rotation once its timelock elapsed.
+        Uniqueness is re-checked against the slots as they are NOW."""
         if not _is_int(index) or index < 0 or index >= REGISTRY_COUNT:
             _fail(ERR_INPUT, "registry index out of range")
         at = int(self.registry_pending_at[index])
@@ -762,7 +818,9 @@ class LegacyVault(gl.contract.Contract):
             _fail(ERR_STATE, "no pending rotation")
         if self._now() < at:
             _fail(ERR_TIME, "registry timelock still running")
-        self.registry_url[index] = self.registry_pending_url[index]
+        url = self.registry_pending_url[index]
+        self._assert_registry_unique(index, url, include_pending=False)
+        self.registry_url[index] = url
         self.registry_pending_url[index] = ""
         self.registry_pending_at[index] = 0
 
@@ -786,6 +844,26 @@ class LegacyVault(gl.contract.Contract):
         # Inside GenVM datetime.now() is the transaction timestamp; the direct
         # harness patches it identically so warp() controls it.
         return int(datetime.now(timezone.utc).timestamp())
+
+    def _assert_registry_unique(self, index: int, url: str, include_pending: bool) -> None:
+        """A URL and a host may each occupy at most one slot. Compares against
+        every OTHER slot's active endpoint and (when staging) its pending one."""
+        host = _registry_host(url)
+        for j in range(REGISTRY_COUNT):
+            if j == index:
+                continue
+            others = [self.registry_url[j]]
+            if include_pending and int(self.registry_pending_at[j]) != 0:
+                others.append(self.registry_pending_url[j])
+            for other in others:
+                if other == url or _registry_host(other) == host:
+                    _fail(ERR_INPUT, f"registry duplicates slot {j}: URL and host must be unique per slot")
+
+    def _index_vault(self, key: str, vault_id: int) -> None:
+        self.account_vaults.get_or_insert_default(key).append(vault_id)
+
+    def _is_invalidated(self, vault_id: int, cert_hash: str) -> bool:
+        return cert_hash != "" and _cert_key(vault_id, cert_hash) in self.invalidated_certs
 
     def _vault(self, vault_id: u256) -> Vault:
         if vault_id not in self.vaults:
@@ -820,7 +898,7 @@ class LegacyVault(gl.contract.Contract):
                 return True
         return False
 
-    def _cancel_open_claim(self, v: Vault) -> int:
+    def _cancel_open_claim(self, vault_id: int, v: Vault) -> int:
         """Reset claim fields on `v` (caller persists it). Returns the bond
         confiscated for the owner (0 when no claim was open) and debits
         escrow for it; the caller is responsible for paying it out."""
@@ -828,12 +906,18 @@ class LegacyVault(gl.contract.Contract):
         if st not in (ST_CLAIM_INITIATED, ST_VETO_PERIOD):
             return 0
         bond = int(v.claim_bond)
+        if st == ST_VETO_PERIOD and v.cert_hash != "":
+            # Veto / heartbeat / revoke during the challenge period: the
+            # certificate that opened it can never open another claim on THIS
+            # vault.
+            self.invalidated_certs[_cert_key(vault_id, v.cert_hash)] = True
         v.state = ST_ACTIVE
         v.claim_bond = 0
         v.claimant = v.owner
         v.claim_started_at = 0
         v.veto_until = 0
         v.cert_epoch = 0
+        v.cert_hash = ""
         self.escrowed -= bond
         return bond
 
@@ -899,6 +983,7 @@ class LegacyVault(gl.contract.Contract):
             "claim_started_at": int(v.claim_started_at),
             "veto_until": int(v.veto_until),
             "cert_epoch": int(v.cert_epoch),
+            "cert_hash": v.cert_hash,
             "verify_attempts": int(v.verify_attempts),
             "finalized_at": int(v.finalized_at),
             "required_bond": str(self._required_bond(int(v.principal))),

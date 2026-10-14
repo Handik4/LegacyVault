@@ -15,7 +15,9 @@ interface Probe {
 
 const STATE_LABEL: Record<SourceOutcome["state"], { tone: "healthy" | "slash" | "neutral" | "veto"; text: string }> = {
   confirmed: { tone: "healthy", text: "Confirmed" },
-  no_record: { tone: "slash", text: "No matching record" },
+  revoked: { tone: "slash", text: "Revoked (dissent)" },
+  absent: { tone: "neutral", text: "No record (abstains)" },
+  unconfirmed: { tone: "neutral", text: "Not a valid confirmation (abstains)" },
   unreachable: { tone: "veto", text: "Not responding" },
 };
 
@@ -27,7 +29,7 @@ async function probe(baseUrl: string, commitment: string, ctx: Parameters<typeof
     return await readWithTimeout(async (signal) => {
       const res = await fetch(`${baseUrl}/${commitment}.json`, { signal, cache: "no-store" });
       if (res.status === 404 || res.status === 410) {
-        return { state: "no_record", certHash: "", deathEpoch: 0, detail: `HTTP ${res.status}: no record published.` } as SourceOutcome;
+        return { state: "absent", certHash: "", deathEpoch: 0, detail: `HTTP ${res.status}: no record published.` } as SourceOutcome;
       }
       if (!res.ok) return unreachable(`HTTP ${res.status}`);
       let body: unknown;
@@ -78,7 +80,7 @@ export function RegistryInspector() {
 
   return (
     <div>
-      <SectionTitle eyebrow="Registry inspector" title="Three independent sources, quorum of two, unanimity among responders">
+      <SectionTitle eyebrow="Registry inspector" title="Three independent sources, two matching confirmations, no active dissent">
         Registry endpoints are fixed in the contract and rotate only through a 7-day timelock. Claimants never supply a URL.
       </SectionTitle>
 
@@ -158,7 +160,7 @@ export function RegistryInspector() {
                   key={i}
                   title={p.host}
                   className={`h-3 flex-1 rounded-full ${
-                    p.outcome.state === "confirmed" ? "bg-forest-600" : p.outcome.state === "no_record" ? "bg-crimson-600" : "bg-slate-300"
+                    p.outcome.state === "confirmed" ? "bg-forest-600" : p.outcome.state === "revoked" ? "bg-crimson-600" : "bg-slate-300"
                   }`}
                 />
               ))}

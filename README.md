@@ -14,9 +14,9 @@ a fraudulent claim and confiscate the claimant's bond.
 | | |
 |---|---|
 | **Network** | GenLayer Studio Next, chain `61997` |
-| **Contract** | [`0x110a44B8941882d3d65Ffc1018f4Ce6C330D1cB0`](https://explorer-studio-next.genlayer.com/address/0x110a44B8941882d3d65Ffc1018f4Ce6C330D1cB0) |
-| **Deploy tx** | `0xfd6de2e846d5cbdff66f566f50eec97b98b59c3b909e5bdd091e6f9f93858b9b` (FINALIZED, MAJORITY_AGREE, FINISHED_WITH_RETURN) |
-| **Source hash** | `sha256 31c1bcdd57dd691c09f591ce9f0e4314083b53dba0bf5cd27b9a98372fbf5b13`, byte-identical to `contracts/legacy_vault.py` (on-chain code fetched via `gen_getContractCode` and re-hashed) |
+| **Contract** | [`0xa41CD400d24bc6F3dADB09D8Eb97937b3F8a74DF`](https://explorer-studio-next.genlayer.com/address/0xa41CD400d24bc6F3dADB09D8Eb97937b3F8a74DF) |
+| **Deploy tx** | `0xcfdc77f36ecbd2c4702d3b477c449d968ef6d2198c48a718ca109dfd3f49824d` (FINALIZED, MAJORITY_AGREE, FINISHED_WITH_RETURN) |
+| **Source hash** | `sha256 17b09372e6ca1c2d9511144f038d6330cfca97a25794097868dcaff89565b608`, byte-identical to `contracts/legacy_vault.py` (on-chain code fetched via `gen_getContractCode` and re-hashed) |
 | **RPC** | `https://studio-next.genlayer.com/api` |
 
 ## Status, stated plainly
@@ -30,13 +30,13 @@ a fraudulent claim and confiscate the claimant's bond.
   `FeeValueMustBeNonZero(1)` because no fee quote could be derived. The deploy
   script now skips the seed when no quote exists and records that in
   `deployments/studio-next.json`. To seed once the RPC recovers:
-  `LEGACYVAULT_DEPLOY_TX=0xfd6de2e8… genlayer deploy --rpc https://studio-next.genlayer.com/api`
+  `LEGACYVAULT_DEPLOY_TX=0xcfdc77f3… genlayer deploy --rpc https://studio-next.genlayer.com/api`
 - **Constructor state not read back** for the same reason (`verification.registries`).
 - **Registry mirrors** are served from [`deployments/mock_registry/`](deployments/mock_registry/README.md)
   of `github.com/Handik4/LegacyVault` through three distinct hosts (raw.githubusercontent.com,
   jsDelivr, githack). They are one repository behind three CDNs, i.e. a testnet
   simulation of three registries, not independent civil authorities.
-- **No live-consensus integration run.** The 218 contract tests run in GenVM *direct
+- **No live-consensus integration run.** The 229 contract tests run in GenVM *direct
   mode*, which executes the leader function and replays validator closures via
   `run_validator`; it does not exercise real multi-validator consensus.
 - **No third-party audit.** "Hardened" means the invariants below are each pinned by
@@ -84,30 +84,41 @@ is compared by every validator; it is never free text.
 
 | verdict | Meaning | Effect |
 |---|---|---|
-| `0` NO_RECORD_FOUND | ≥2 sources responded (200 or 404) but fewer than 2 matching `CONFIRMED` records, or a source holds a conflicting / explicitly negative record | claim rejected; bond forfeited **into the estate** |
-| `1` VERIFIED_DECEASED | ≥2 sources returned `CONFIRMED` with the identical `cert_hash` and `cert_epoch`, and no responder returned a conflicting or negative record | enter the 30-day challenge lock |
-| `2` QUORUM_FAILURE | fewer than 2 sources responded | nothing changes; retry without slashing |
+| `0` NO_RECORD_FOUND | an explicit `REVOKED` record or conflicting `CONFIRMED` certificates among the responders, **or** a 2-of-3 confirmation is impossible even if every unreachable source answered | claim rejected; bond forfeited **into the estate** |
+| `1` VERIFIED_DECEASED | ≥2 sources returned `CONFIRMED` with the identical `cert_hash` and `cert_epoch`, and no responder returned a `REVOKED` or conflicting record | enter the 30-day challenge lock |
+| `2` QUORUM_FAILURE | fewer than 2 sources responded, **or** 2 responded without dissent but an unreachable source could still supply the second matching confirmation | nothing changes; retry without slashing |
 
 How each source answer is classified:
 
 | Source answer | Treated as | Effect on quorum |
 |---|---|---|
 | Valid `CONFIRMED` record for this vault | positive proof | counts toward the ≥2 matching confirmations |
-| Clean `404` / `410` | **absent**: "no record at this source" | responds, but abstains; it cannot veto two matching confirmations (CDN lag / regional sync delay) |
-| Well-formed record that is not a valid confirmation here (`REVOKED`, `ALIVE`, wrong identity, predates the vault, death in the future, ...) | explicit negative | blocks verification → `NO_RECORD` |
-| `CONFIRMED` with a different `cert_hash` or `cert_epoch` than the others | conflicting positive | blocks verification → `NO_RECORD` |
-| Timeout, 5xx / 429 / 403, unparseable body, non-object JSON, body over 8 KB, **foreign schema** | not responding | does not count as a responder |
+| Clean `404` / `410` | **abstention** ("no record at this source") | responds, but cannot veto two matching confirmations (CDN lag / regional sync delay) |
+| Any other well-formed record that is not a valid confirmation here (`ALIVE`, `PENDING`, other identity, predates the vault, future date, bad hash, ...) | **abstention**, same as a 404 | carries no weight either way |
+| Record for this vault with status exactly `REVOKED` | **active dissent** | blocks verification → `NO_RECORD` |
+| Valid `CONFIRMED` records that differ in `cert_hash` or `cert_epoch` | **active dissent** | blocks verification → `NO_RECORD` |
+| Timeout, 5xx / 429 / 403, unparseable body, non-object JSON, body over 8 KB, **foreign schema** | down (not responding) | not a responder; can still complete a quorum later |
 
-So `CONFIRMED + CONFIRMED + 404` verifies, while `CONFIRMED + CONFIRMED + REVOKED`,
-`CONFIRMED + CONFIRMED + (different certificate)` and `CONFIRMED + 404 + 404` all
-resolve to `NO_RECORD`. For verdict `1`, `source_count` is the number of matching
-confirmations; otherwise it is the number of responders. A broken registry can never
-force a bond forfeiture on an honest claimant, because a foreign schema is an outage.
+Active dissent is deliberately narrow: only an explicit `REVOKED` record or
+conflicting confirmed certificate data. The decision order is: (1) fewer than 2
+responders → `QUORUM_FAILURE`; (2) dissent → `NO_RECORD`; (3) ≥2 matching
+confirmations → `VERIFIED_DECEASED`; (4) confirmed + down sources could still reach
+2 → `QUORUM_FAILURE`; (5) otherwise → `NO_RECORD`.
 
-A record is `CONFIRMED` only if: schema matches; `identity_commitment` equals the
-vault's; `status == "CONFIRMED"`; `certificate_hash` is 64-hex; `date_of_death` is a
-real calendar day **≥ the vault's creation day**, **not in the future**, and **not
-before the owner's last heartbeat** (an owner cannot sign after the day they died).
+| Sources `[A, B, C]` | Verdict |
+|---|---|
+| `CONFIRMED, CONFIRMED, CONFIRMED` / `CONFIRMED, CONFIRMED, 404` / `CONFIRMED, CONFIRMED, outage` | `1` VERIFIED_DECEASED |
+| `CONFIRMED, 404, outage` | `2` QUORUM_FAILURE, bond preserved (the outage could be the second confirmation) |
+| `CONFIRMED, outage, outage` | `2` QUORUM_FAILURE |
+| `CONFIRMED, 404, 404` / `404, 404, outage` / `404, 404, 404` | `0` NO_RECORD (2-of-3 impossible) |
+| `CONFIRMED, CONFIRMED, REVOKED` / `CONFIRMED, CONFIRMED, different certificate` / `CONFIRMED, REVOKED, outage` | `0` NO_RECORD (active dissent) |
+
+For verdict `1`, `source_count` is the number of matching confirmations; otherwise it
+is the number of responders.
+
+**What can and cannot forfeit a bond.** Network outages, schema errors and a
+single-source 404 lag cannot force a bond forfeiture. Only ≥2 negative (404)
+responses, or an explicit conflicting / `REVOKED` certificate record, forfeits it.
 
 ## Security matrix
 
@@ -115,12 +126,12 @@ before the owner's last heartbeat** (an owner cannot sign after the day they die
 |---|---|---|---|
 | 1 | Claimant points validators at a forged page | No URL parameter exists. Record URL = `{governed base}/{commitment}.json`; bases are https-only DNS names (no IP literals, ports, userinfo, query), pairwise distinct hosts | `test_nothing_in_the_abi_accepts_a_url`, `test_record_url_is_derived_from_commitment_not_supplied`, `test_constructor_rejects_unsafe_registry_urls` |
 | 2 | Governor swaps in malicious registries | 7-day timelock (`propose_registry` → permissionless `activate_registry`), independence re-checked, governor has no fund path | `test_rotation_is_timelocked_seven_days`, `test_governor_has_no_path_to_user_funds` |
-| 3 | One registry lies or lags | 2-of-3 matching `CONFIRMED` quorum. A lagging `404` abstains and cannot veto two matching confirmations; a conflicting cert hash/date or an explicit `REVOKED`/`ALIVE` record blocks → `NO_RECORD` | `test_responders_must_all_agree_one_dissent_blocks`, `test_404_in_any_slot_does_not_block_two_confirmed`, `test_two_confirmed_plus_*`, `test_conflicting_*` |
+| 3 | One registry lies or lags | 2-of-3 matching `CONFIRMED` quorum. A lagging `404` (or any generic unconfirmed record) abstains and cannot veto two matching confirmations; only a `REVOKED` record or conflicting cert hash/date blocks → `NO_RECORD`. An outage that could complete the quorum yields `QUORUM_FAILURE`, never a slash | `test_responders_must_all_agree_one_dissent_blocks`, `test_404_in_any_slot_does_not_block_two_confirmed`, `test_generic_unconfirmed_records_abstain_like_a_404`, `test_two_confirmed_plus_explicit_revoked_blocks`, `test_one_confirmed_one_404_one_outage_returns_quorum_failure_without_slashing`, `test_conflicting_*` |
 | 4 | Leader forges verdict / source count / epoch | Validator rejects wrong keys, non-int/bool types, out-of-range or inconsistent values, then re-derives and compares all four fields | `TestValidatorEquivalence` (9 tests) |
 | 5 | Leader smuggles free text into storage | Only three ints and one 64-hex-or-empty digest cross consensus; payload re-gated before state change | `test_validator_rejects_malformed_or_extra_key_payload` |
 | 6 | Premature claim / owner hospitalised | Inactivity ≥90d, 10% bond, 30-day minimum challenge lock (owner may veto any time before finalization), bond confiscated to owner | `test_claim_before_inactivity_threshold_reverts`, `test_owner_veto_slashes_claimant_bond_100_percent` |
 | 7 | Stale / pre-dated certificate | Death date ≥ creation day, ≤ now, ≥ last heartbeat; replay after a veto fails | `test_certificate_predating_vault_creation_rejected`, `test_stale_certificate_cannot_be_replayed_after_a_veto` |
-| 8 | Bond griefing by a malfunctioning registry | Only a clean answer can slash; foreign schema = outage; a lone `404` among matching confirmations never slashes | `test_foreign_schema_is_not_a_response_*` |
+| 8 | Bond griefing by a malfunctioning registry | Outages, schema errors and a single-source 404 lag cannot forfeit a bond; only ≥2 negative (404) responses or an explicit `REVOKED` / conflicting certificate record can | `test_one_confirmed_one_404_one_outage_returns_quorum_failure_without_slashing`, `test_foreign_schema_is_not_a_response_*` |
 | 9 | Third party steals an allocation | `claim_inheritance` requires the caller to be that beneficiary, once | `test_unauthenticated_caller_cannot_steal_heir_allocation`, `test_heir_cannot_double_claim` |
 | 10 | One heir blocks the rest | Pull payments, no payout loop | `test_one_heir_never_claiming_does_not_block_the_others` |
 | 11 | Rounding dust locked | Remainder to heir 0; sum always equals principal | `test_bps_rounding_remainder_assigned_to_primary_heir_zero_dust_locked`, `test_split_never_loses_a_wei` |
@@ -136,9 +147,18 @@ before the owner's last heartbeat** (an owner cannot sign after the day they die
 - **Registry honesty is the root of trust.** If all responding registries confirm a
   false death, only the owner's veto stands between a claimant and the estate.
 - **Registry lag can still cost the claimant.** One lagging registry is tolerated
-  (2 matching confirmations + a `404` verifies), but if fewer than 2 registries have
-  published yet, the claim resolves `NO_RECORD` and the bond joins the estate; the
-  heir can retry with a new bond.
+  (2 matching confirmations + a `404` verifies; `CONFIRMED + 404 + outage` is a
+  retryable `QUORUM_FAILURE`), but if two or more registries answer `404` the claim
+  resolves `NO_RECORD` and the bond joins the estate; the heir can retry with a new
+  bond.
+- **A single faulty registry can act as a safety brake.** If one compromised or
+  misconfigured registry serves a well-formed `REVOKED` record or a conflicting
+  certificate for a real death, it blocks automated succession and the claim bond
+  is forfeited, even though the other two registries are right. The protocol
+  chooses this conservative failure mode over letting a lone dissent be outvoted.
+  Recovery is to have the governor replace the faulty registry slot
+  (`propose_registry` → 7-day timelock → `activate_registry`) and have the heir
+  claim again with a new bond.
 - **Note references are public on-chain.** The contract withholds them from views
   until finalization, but storage is readable. Store ciphertext or a pointer to it.
 - **Duplicate commitments are allowed** (uniqueness would let anyone squat a
@@ -198,7 +218,7 @@ source flipping between `404` and an outage no longer changes the payload.
 
 ```
 contracts/legacy_vault.py        Intelligent Contract
-tests/                           pytest direct-mode suite (218 cases)
+tests/                           pytest direct-mode suite (229 cases)
 deploy/deploy_legacy_vault.ts    genlayer deploy script: fee derivation, strict receipts, seed + verify
 deployments/studio-next.json     deployment record (what was and was not verified)
 deployments/legacy_vault_abi.json  schema from genvm-lint
@@ -212,7 +232,7 @@ frontend/                        Next.js 14.2.35 + Tailwind light-mode UI
 # Contract tests (Python 3.12 required by the genlayer-test pin)
 uv venv --python 3.12
 uv pip install --prerelease=allow -r requirements-dev.txt
-.venv/bin/python -m pytest -q                     # 218 passed
+.venv/bin/python -m pytest -q                     # 229 passed
 
 # Lint + SDK validation + Pyright typecheck (both clean)
 GENVM_VERSION=v0.6.0-rc8 .venv/bin/genvm-lint check contracts/legacy_vault.py

@@ -357,9 +357,51 @@ class TestRegistryConsensus:
         assert v["principal"] == str(11 * GEN)  # 10 + forfeited 1 bond
         assert env.c.get_protocol_overview()["escrowed"] == str(11 * GEN)
 
-    def test_one_not_found_among_two_responders_is_no_record(self, env):
+    def test_one_confirmed_one_404_one_outage_returns_quorum_failure_without_slashing(self, env):
+        """[CONFIRMED, 404, outage]: the down source could still supply the second
+        matching confirmation, so this must be a retryable QUORUM_FAILURE and the
+        claimant's bond must not move."""
         vid = self._ready(env)
-        mock_registries(env.vm, record(env.commit), 404, 500)
+        for answers in (
+            [record(env.commit), 404, 500],
+            [404, record(env.commit), 503],
+            [500, 404, record(env.commit)],
+        ):
+            mock_registries(env.vm, *answers)
+            assert env.verify(vid) == 2
+            v = env.c.get_vault(vid)
+            assert v["state_name"] == "CLAIM_INITIATED"
+            assert v["claim_bond"] == str(GEN)  # preserved, not forfeited
+            assert v["principal"] == str(10 * GEN)  # estate did not absorb it
+        # ...and it is genuinely retryable once the third registry recovers.
+        mock_registries(env.vm, record(env.commit), 404, record(env.commit))
+        assert env.verify(vid) == 1
+
+    def test_one_confirmed_one_unconfirmed_one_outage_is_quorum_failure(self, env):
+        vid = self._ready(env)
+        mock_registries(env.vm, record(env.commit), record(env.commit, status="PENDING"), 500)
+        assert env.verify(vid) == 2
+        assert env.c.get_vault(vid)["claim_bond"] == str(GEN)
+
+    def test_two_404s_and_one_outage_forfeits_because_quorum_is_impossible(self, env):
+        vid = self._ready(env)
+        mock_registries(env.vm, 404, 500, 404)
+        assert env.verify(vid) == 0
+        assert env.c.get_vault(vid)["principal"] == str(11 * GEN)
+
+    def test_one_confirmed_and_two_404s_is_no_record(self, env):
+        vid = self._ready(env)
+        mock_registries(env.vm, record(env.commit), 404, 404)
+        assert env.verify(vid) == 0
+
+    def test_revoked_with_an_outage_is_dissent_not_quorum_failure(self, env):
+        vid = self._ready(env)
+        mock_registries(env.vm, record(env.commit), record(env.commit, status="REVOKED"), 500)
+        assert env.verify(vid) == 0
+
+    def test_conflicting_certificates_with_an_outage_is_no_record(self, env):
+        vid = self._ready(env)
+        mock_registries(env.vm, record(env.commit), record(env.commit, certificate_hash="cd" * 32), 500)
         assert env.verify(vid) == 0
 
     def test_responders_must_all_agree_one_dissent_blocks(self, env):
@@ -395,11 +437,28 @@ class TestRegistryConsensus:
         )
         assert env.verify(vid) == 0
 
-    @pytest.mark.parametrize("status", ["REVOKED", "ALIVE"])
-    def test_two_confirmed_plus_explicit_revoked_or_alive_blocks(self, env, status):
+    def test_two_confirmed_plus_explicit_revoked_blocks(self, env):
         vid = self._ready(env)
-        mock_registries(env.vm, record(env.commit), record(env.commit), record(env.commit, status=status))
+        mock_registries(env.vm, record(env.commit), record(env.commit), record(env.commit, status="REVOKED"))
         assert env.verify(vid) == 0
+
+    @pytest.mark.parametrize(
+        "over",
+        [
+            {"status": "ALIVE"},
+            {"status": "PENDING"},
+            {"identity_commitment": commitment("Charles Babbage", "1791-12-26", "GB-LND")},
+            {"identity_commitment": commitment("Charles Babbage", "1791-12-26", "GB-LND"), "status": "REVOKED"},
+            {"date_of_death": "2999-01-01"},
+            {"certificate_hash": "not-hex"},
+        ],
+    )
+    def test_generic_unconfirmed_records_abstain_like_a_404(self, env, over):
+        """Dissent is scoped to REVOKED or conflicting CONFIRMED data only; an
+        unrelated / unconfirmed record cannot veto two matching confirmations."""
+        vid = self._ready(env)
+        mock_registries(env.vm, record(env.commit), record(env.commit), record(env.commit, **over))
+        assert env.verify(vid) == 1
 
     def test_single_confirmed_plus_two_404s_is_no_record(self, env):
         vid = self._ready(env)
@@ -420,6 +479,24 @@ class TestRegistryConsensus:
         vid = self._ready(env)
         mock_registries(env.vm, record(env.commit), 503, record(env.commit))
         assert env.verify(vid) == 1
+
+    def test_validator_agrees_on_outage_quorum_failure_and_blocks_forged_slash(self, env):
+        vid = env.create()
+        env.warp(100)
+        env.claim(vid)
+        mock_registries(env.vm, record(env.commit), 404, 500)
+        assert env.verify(vid) == 2
+        assert env.vm.run_validator() is True
+        assert env.vm.run_validator(
+            leader_result={"verdict": 2, "source_count": 2, "cert_epoch": 0, "cert_hash": ""}
+        ) is True
+        # a leader that claims NO_RECORD (slash) or VERIFIED here is rejected
+        assert env.vm.run_validator(
+            leader_result={"verdict": 0, "source_count": 2, "cert_epoch": 0, "cert_hash": ""}
+        ) is False
+        assert env.vm.run_validator(
+            leader_result={"verdict": 1, "source_count": 2, "cert_epoch": day_epoch("2026-02-10"), "cert_hash": CERT}
+        ) is False
 
     def test_validator_accepts_verified_payload_with_lagging_404(self, env):
         vid = env.create()

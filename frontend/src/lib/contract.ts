@@ -19,7 +19,7 @@ export const NETWORK = {
 } as const;
 
 export const CONTRACT_ADDRESS: string =
-  process.env.NEXT_PUBLIC_LEGACYVAULT_ADDRESS ?? "0x110a44B8941882d3d65Ffc1018f4Ce6C330D1cB0";
+  process.env.NEXT_PUBLIC_LEGACYVAULT_ADDRESS ?? "0xa41CD400d24bc6F3dADB09D8Eb97937b3F8a74DF";
 
 export const READ_TIMEOUT_MS = 6_000;
 

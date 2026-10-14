@@ -19,11 +19,13 @@
 #      rotate only through a 7-day governor timelock. The record URL is
 #      derived: {registry_base}/{identity_commitment}.json.
 #   2. QUORUM. >= 2 of 3 registries must return the same CONFIRMED certificate
-#      (same hash, same date of death). A clean 404/410 is "no record at this
-#      source": it abstains and cannot veto two matching confirmations (CDN lag),
-#      but a source that returns a conflicting certificate or an explicit
-#      non-confirming record (REVOKED / ALIVE / wrong identity) blocks the
-#      claim. Fewer than 2 responders is a retryable QUORUM_FAILURE.
+#      (same hash, same date of death). A clean 404/410 (and any generic
+#      unconfirmed record) abstains: it cannot veto two matching confirmations
+#      (CDN lag). Active dissent is only an explicit REVOKED record or CONFIRMED
+#      records that conflict on hash / date. A bond is forfeited (NO_RECORD) only
+#      on such dissent, or when a 2-of-3 confirmation is impossible even if every
+#      unreachable source answered; if a down source could still complete the
+#      quorum the verdict is a retryable QUORUM_FAILURE and nothing is slashed.
 #   3. STRICT PAYLOAD EQUIVALENCE. The only thing validators agree on is the
 #      4-field payload {"verdict": int, "source_count": int, "cert_epoch": int,
 #      "cert_hash": str}. The validator checks exact keys / types / internal
@@ -106,6 +108,7 @@ MAX_NOTE_LEN = 512
 MAX_RECORD_BYTES = 8_192
 RECORD_SCHEMA = "legacyvault.vital-record/v1"
 STATUS_CONFIRMED = "CONFIRMED"
+STATUS_REVOKED = "REVOKED"
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _ISO_DATE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
@@ -160,15 +163,20 @@ def _parse_iso_day(text: str) -> int:
 def _evaluate_record(
     record: object, commitment: str, creation_day: int, now: int, last_heartbeat: int
 ) -> dict:
-    """Judge one well-formed JSON record. Never raises.
+    """Judge one well-formed JSON record. Never raises. Returns a state of:
 
-    A record is CONFIRMED only if every one of these holds: schema matches, the
-    record names exactly this vault's identity commitment, status is CONFIRMED,
-    the certificate hash is a 64-char hex digest, the date of death is a valid
-    calendar day that is not before the vault was created, not in the future, and
-    does not precede the owner's own last heartbeat (an owner cannot sign
-    transactions after the day they died)."""
-    none = {"state": "no_record", "cert_hash": "", "death_epoch": 0}
+    "confirmed"   every one of these holds: schema matches, the record names
+                  exactly this vault's identity commitment, status is CONFIRMED,
+                  the certificate hash is a 64-char hex digest, the date of death
+                  is a valid calendar day that is not before the vault was
+                  created, not in the future, and does not precede the owner's
+                  own last heartbeat (an owner cannot sign after they died).
+    "revoked"     schema and identity match and status is exactly REVOKED: the
+                  registry affirmatively withdraws a death record. The only
+                  explicit negative.
+    "unconfirmed" anything else (other status, other identity, unusable hash or
+                  date). Carries no weight either way, like a 404."""
+    none = {"state": "unconfirmed", "cert_hash": "", "death_epoch": 0}
     if not isinstance(record, dict):
         return none
     if record.get("schema") != RECORD_SCHEMA:
@@ -176,7 +184,10 @@ def _evaluate_record(
     ident = record.get("identity_commitment")
     if not isinstance(ident, str) or ident.lower() != commitment:
         return none
-    if record.get("status") != STATUS_CONFIRMED:
+    status = record.get("status")
+    if status == STATUS_REVOKED:
+        return {"state": "revoked", "cert_hash": "", "death_epoch": 0}
+    if status != STATUS_CONFIRMED:
         return none
     cert = record.get("certificate_hash")
     if not isinstance(cert, str) or not _HEX64.match(cert.lower()):
@@ -196,10 +207,9 @@ def _evaluate_record(
 def _fetch_source(base_url: str, commitment: str, creation_day: int, now: int, last_heartbeat: int) -> dict:
     """Query ONE registry. Returns {"responded": bool, "state", "cert_hash",
     "death_epoch"}. Unreachable / rate-limited / 5xx / corrupt transport counts
-    as NOT responded; a clean 404/410 is a responded "absent" (abstains, never
-    vetoes); a well-formed non-confirming record is a responded "no_record"
-    (explicit negative)."""
-    silent = {"responded": False, "state": "no_record", "cert_hash": "", "death_epoch": 0}
+    as NOT responded; a clean 404/410 is a responded "absent" and a well-formed
+    record is "confirmed", "revoked" or "unconfirmed" (see _evaluate_record)."""
+    silent = {"responded": False, "state": "down", "cert_hash": "", "death_epoch": 0}
     url = f"{base_url}/{commitment}.json"
     try:
         res = gl.nondet.web.get(url)
@@ -247,40 +257,47 @@ def _fetch_source(base_url: str, commitment: str, creation_day: int, now: int, l
 def _aggregate(results: list) -> dict:
     """Collapse per-source outcomes to the discrete consensus payload.
 
-    Each source is one of: not responded (outage / 5xx / foreign schema),
-    "absent" (clean 404/410: no record at this source, which abstains from
-    positive proof), "confirmed" (a valid CONFIRMED record), or "no_record" (a
-    well-formed record that is NOT a valid confirmation for this vault: REVOKED,
-    ALIVE, wrong identity, predates the vault, ...; an explicit negative).
+    Per source: DOWN (outage / 5xx / foreign schema), or it responded with
+    "confirmed" (valid CONFIRMED record), "revoked" (explicit REVOKED record),
+    or an abstention: "absent" (clean 404/410) or "unconfirmed" (any other
+    well-formed record, e.g. other identity or generic status), which carry no
+    weight either way.
 
-      * fewer than 2 responders                      -> QUORUM_FAILURE
-      * >= 2 CONFIRMED, one identical certificate
-        (hash + epoch), and no source that holds a
-        conflicting or explicitly negative record    -> VERIFIED_DECEASED
-      * anything else with >= 2 responders           -> NO_RECORD
+    Active dissent is exactly two things: a REVOKED record, or CONFIRMED records
+    that disagree on cert_hash / cert_epoch. Then, in order:
 
-    A lagging mirror that still answers 404 therefore cannot veto two matching
-    confirmations, while a registry that affirmatively contradicts them can.
-    For VERIFIED_DECEASED, source_count is the number of matching confirmations;
-    otherwise it is the number of responders."""
+      * fewer than 2 responders                          -> QUORUM_FAILURE
+      * dissent present                                  -> NO_RECORD
+      * >= 2 matching CONFIRMED                          -> VERIFIED_DECEASED
+      * otherwise: confirmed + down sources could still
+        reach 2 matching confirmations                   -> QUORUM_FAILURE
+        (retry; no slash: an outage must never forfeit a bond)
+      * otherwise (2-of-3 is now impossible)             -> NO_RECORD
+
+    So [CONFIRMED, 404, outage] is QUORUM_FAILURE, [CONFIRMED, 404, 404] and
+    [404, 404, outage] are NO_RECORD, and a lagging 404 beside two matching
+    confirmations cannot veto them. For VERIFIED_DECEASED, source_count is the
+    number of matching confirmations; otherwise it is the number of responders."""
     responded = [r for r in results if r["responded"]]
     n = len(responded)
+    down = len(results) - n
     if n < MIN_SOURCES:
         return {"verdict": V_QUORUM_FAILURE, "source_count": n, "cert_epoch": 0, "cert_hash": ""}
     confirmed = [r for r in responded if r["state"] == "confirmed"]
-    dissent = [r for r in responded if r["state"] == "no_record"]
-    if len(confirmed) >= MIN_SOURCES and not dissent:
+    revoked = [r for r in responded if r["state"] == "revoked"]
+    certs = {(r["cert_hash"], r["death_epoch"]) for r in confirmed}
+    if revoked or len(certs) > 1:
+        return {"verdict": V_NO_RECORD, "source_count": n, "cert_epoch": 0, "cert_hash": ""}
+    if len(confirmed) >= MIN_SOURCES:
         first = confirmed[0]
-        if all(
-            r["cert_hash"] == first["cert_hash"] and r["death_epoch"] == first["death_epoch"]
-            for r in confirmed
-        ):
-            return {
-                "verdict": V_VERIFIED_DECEASED,
-                "source_count": len(confirmed),
-                "cert_epoch": int(first["death_epoch"]),
-                "cert_hash": first["cert_hash"],
-            }
+        return {
+            "verdict": V_VERIFIED_DECEASED,
+            "source_count": len(confirmed),
+            "cert_epoch": int(first["death_epoch"]),
+            "cert_hash": first["cert_hash"],
+        }
+    if len(confirmed) + down >= MIN_SOURCES:
+        return {"verdict": V_QUORUM_FAILURE, "source_count": n, "cert_epoch": 0, "cert_hash": ""}
     return {"verdict": V_NO_RECORD, "source_count": n, "cert_epoch": 0, "cert_hash": ""}
 
 
@@ -311,7 +328,9 @@ def _payload_well_formed(p: object) -> bool:
     if h != "" or c != 0:
         return False
     if v == V_QUORUM_FAILURE:
-        return n < MIN_SOURCES
+        # < 2 responders, or 2 responders with a down source that could still
+        # have completed the quorum. 3 clean responders can never be a failure.
+        return n < REGISTRY_COUNT
     return n >= MIN_SOURCES
 
 
@@ -676,8 +695,10 @@ class LegacyVault(gl.contract.Contract):
         """Claimant triggers the 3-registry death-record check.
 
         Returns the verdict: 0 NO_RECORD (claim rejected, bond forfeited to the
-        estate), 1 VERIFIED_DECEASED (30-day veto window opens), 2 QUORUM_FAILURE
-        (fewer than 2 registries answered; nothing is slashed, retry later)."""
+        estate: explicit REVOKED / conflicting certificate, or a 2-of-3
+        confirmation is impossible), 1 VERIFIED_DECEASED (30-day challenge lock
+        opens), 2 QUORUM_FAILURE (too few registries answered, or an unreachable
+        one could still complete the quorum; nothing is slashed, retry later)."""
         v = self._vault(vault_id)
         if int(v.state) != ST_CLAIM_INITIATED:
             _fail(ERR_STATE, "no claim awaiting verification")

@@ -6,7 +6,15 @@ export const RECORD_SCHEMA = "legacyvault.vital-record/v1";
 export const DAY = 86_400;
 export const MIN_SOURCES = 2;
 
-export type SourceState = "confirmed" | "no_record" | "unreachable";
+/**
+ * confirmed    valid CONFIRMED record for this vault (positive proof)
+ * revoked      record for this vault with status exactly REVOKED (active dissent)
+ * absent       clean 404/410: no record at this source (abstains)
+ * unconfirmed  any other well-formed record (other identity, generic status,
+ *              unusable date/hash): abstains exactly like a 404
+ * unreachable  outage / 5xx / foreign schema: not a responder
+ */
+export type SourceState = "confirmed" | "revoked" | "absent" | "unconfirmed" | "unreachable";
 
 export interface SourceOutcome {
   state: SourceState;
@@ -36,12 +44,15 @@ export interface EvalContext {
 }
 
 export function evaluateRecord(record: unknown, ctx: EvalContext): SourceOutcome {
-  const no = (detail: string): SourceOutcome => ({ state: "no_record", certHash: "", deathEpoch: 0, detail });
+  const no = (detail: string): SourceOutcome => ({ state: "unconfirmed", certHash: "", deathEpoch: 0, detail });
   if (record === null || typeof record !== "object" || Array.isArray(record)) return no("Record is not a JSON object.");
   const r = record as Record<string, unknown>;
   if (r.schema !== RECORD_SCHEMA) return no("Unrecognised record schema.");
   if (typeof r.identity_commitment !== "string" || r.identity_commitment.toLowerCase() !== ctx.commitment) {
     return no("Record names a different identity commitment.");
+  }
+  if (r.status === "REVOKED") {
+    return { state: "revoked", certHash: "", deathEpoch: 0, detail: "Registry explicitly REVOKED this record." };
   }
   if (r.status !== "CONFIRMED") return no(`Status is ${String(r.status)}, not CONFIRMED.`);
   if (typeof r.certificate_hash !== "string" || !HEX64.test(r.certificate_hash.toLowerCase())) {
@@ -64,17 +75,26 @@ export interface Consensus {
   certEpoch: number;
 }
 
-/** Collapse per-source outcomes exactly as the contract's _aggregate does. */
+/**
+ * Collapse per-source outcomes exactly as the contract's _aggregate does.
+ * Order: (1) <2 responders -> QUORUM_FAILURE; (2) active dissent (a REVOKED
+ * record, or CONFIRMED records that conflict on hash/epoch) -> NO_RECORD;
+ * (3) >=2 matching CONFIRMED -> VERIFIED; (4) confirmed + unreachable could
+ * still reach 2 -> QUORUM_FAILURE (never slashes on an outage); (5) else
+ * NO_RECORD. 404s and generic unconfirmed records abstain.
+ */
 export function aggregate(outcomes: SourceOutcome[]): Consensus {
   const responded = outcomes.filter((o) => o.state !== "unreachable");
   const n = responded.length;
+  const down = outcomes.length - n;
   if (n < MIN_SOURCES) return { verdict: "QUORUM_FAILURE", code: 2, sourceCount: n, certEpoch: 0 };
   const confirmed = responded.filter((o) => o.state === "confirmed");
-  if (confirmed.length === n) {
-    const f = confirmed[0];
-    if (confirmed.every((o) => o.certHash === f.certHash && o.deathEpoch === f.deathEpoch)) {
-      return { verdict: "VERIFIED_DECEASED", code: 1, sourceCount: n, certEpoch: f.deathEpoch };
-    }
+  const revoked = responded.some((o) => o.state === "revoked");
+  const certs = new Set(confirmed.map((o) => `${o.certHash}:${o.deathEpoch}`));
+  if (revoked || certs.size > 1) return { verdict: "NO_RECORD_FOUND", code: 0, sourceCount: n, certEpoch: 0 };
+  if (confirmed.length >= MIN_SOURCES) {
+    return { verdict: "VERIFIED_DECEASED", code: 1, sourceCount: confirmed.length, certEpoch: confirmed[0].deathEpoch };
   }
+  if (confirmed.length + down >= MIN_SOURCES) return { verdict: "QUORUM_FAILURE", code: 2, sourceCount: n, certEpoch: 0 };
   return { verdict: "NO_RECORD_FOUND", code: 0, sourceCount: n, certEpoch: 0 };
 }

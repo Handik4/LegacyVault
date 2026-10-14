@@ -12,7 +12,7 @@ const STEPS = [
   {
     n: "03",
     title: "Corroborate",
-    body: "Validators query three independent civil registries bound in the contract. Two must answer and every responder must confirm the same certificate.",
+    body: "Validators query three independent civil registries bound in the contract. Two must confirm the same certificate; a lagging 404 abstains, but a REVOKED or conflicting record blocks the claim.",
   },
   {
     n: "04",

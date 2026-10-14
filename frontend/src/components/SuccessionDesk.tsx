@@ -12,8 +12,8 @@ import { Badge, Button, Card, Meter, SectionTitle, StateBadge, TxStatus, short, 
 
 const VERDICT_TEXT: Record<string, { tone: "healthy" | "veto" | "slash"; text: string }> = {
   "1": { tone: "healthy", text: "VERIFIED_DECEASED: 30-day veto window is now open." },
-  "0": { tone: "slash", text: "NO_RECORD_FOUND: the registries did not corroborate a death. Your bond joined the estate." },
-  "2": { tone: "veto", text: "QUORUM_FAILURE: fewer than 2 registries answered. Nothing was slashed; retry shortly." },
+  "0": { tone: "slash", text: "NO_RECORD_FOUND: the registries could not corroborate a death (a REVOKED or conflicting record, or a 2-of-3 confirmation is impossible). Your bond joined the estate." },
+  "2": { tone: "veto", text: "QUORUM_FAILURE: too few registries answered, or an unreachable one could still complete the quorum. Nothing was slashed; retry shortly." },
 };
 
 function Desk({ v, account }: { v: VaultView; account: string }) {
